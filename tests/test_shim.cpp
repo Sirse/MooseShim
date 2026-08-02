@@ -754,9 +754,34 @@ TEST_CASE("CLEAR_RX_BUFFER on an empty queue still succeeds") {
   shim().Close(device);
 }
 
+TEST_CASE("CLEAR_RX_BUFFER emulation is announced once per channel") {
+  const unsigned long device = freshDevice();
+  unsigned long ch = 0;
+  REQUIRE(shim().Connect(device, ISO15765, CAN_29BIT_ID, 500000, &ch) ==
+          STATUS_NOERROR);
+  const size_t logSizeBefore = readShimLog().size();
+
+  // SDA issues this before every request. A live flash read produced 2150 of
+  // them and drowned the log; only the first may be announced.
+  for (int i = 0; i < 20; ++i)
+    REQUIRE(shim().Ioctl(ch, CLEAR_RX_BUFFER, nullptr, nullptr) == STATUS_NOERROR);
+
+  const std::string tail = readShimLog().substr(logSizeBefore);
+  size_t announcements = 0;
+  for (size_t at = tail.find("emulating by draining"); at != std::string::npos;
+       at = tail.find("emulating by draining", at + 1))
+    ++announcements;
+  INFO("shim log tail:\n" << tail);
+  CHECK_MESSAGE(announcements == 1,
+                "twenty emulated calls must produce one line at info level");
+
+  shim().Disconnect(ch);
+  shim().Close(device);
+}
+
 // --- ISO15765_SWDL_FABRICATE instrumentation ---------------------------------
 
-TEST_CASE("every write in fabricate mode fails closed") {
+TEST_CASE("an oversized write in fabricate mode fails closed") {
   const unsigned long device = freshDevice();
   unsigned long ch = 0;
   REQUIRE(shim().Connect(device, ISO15765, CAN_29BIT_ID, 500000, &ch) ==
@@ -765,9 +790,10 @@ TEST_CASE("every write in fabricate mode fails closed") {
           STATUS_NOERROR);
   const size_t logSizeBefore = readShimLog().size();
 
-  // Size is deliberately small: fabrication is a stateful DiCE stream and an
-  // individually valid chunk is no safer to forward than an oversized one.
+  // Larger than one ISO-TP message: the shim cannot split this into
+  // TransferData (0x36) frames, so it must not forward it in a malformed form.
   PASSTHRU_MSG big = makeMsg(ISO15765, CAN_29BIT_ID, {0x00, 0x00, 0x07, 0xe0, 0x36});
+  big.DataSize = 5000;
   unsigned long num = 1;
   CHECK(shim().WriteMsgs(ch, &big, &num, 100) == ERR_NOT_SUPPORTED);
   CHECK(num == 0);
@@ -775,17 +801,21 @@ TEST_CASE("every write in fabricate mode fails closed") {
   const std::string tail = readShimLog().substr(logSizeBefore);
   INFO("shim log tail:\n" << tail);
   CHECK_MESSAGE(tail.find("FABRICATE:") != std::string::npos,
-                "the shim must report a write rejected in fabricate mode");
+                "the shim must report a write it cannot split into 0x36 frames");
 
-  CHECK_FALSE(logHas("WriteMsgs protocol=0x00000006"));
+  CHECK_FALSE(logHas("size=5000"));
 
-  // Explicitly ending the session restores ordinary ISO-TP forwarding.
-  REQUIRE(setConfig(ch, {{j2534::dice::ISO15765_SWDL_FABRICATE, 0}}) ==
-          STATUS_NOERROR);
+  // The decisive case, and the one a live SDA session actually exercises: SDA
+  // sets fabricate mode once, never clears it, and keeps doing ordinary UDS on
+  // the same channel. Blocking those writes broke plain DID reads and wake
+  // commands, so a normally sized write must still reach the target while the
+  // mode is on.
   num = 1;
   PASSTHRU_MSG small =
       makeMsg(ISO15765, CAN_29BIT_ID, {0x00, 0x00, 0x07, 0xe0, 0x22, 0xf1, 0xa3});
   CHECK(shim().WriteMsgs(ch, &small, &num, 100) == STATUS_NOERROR);
+  CHECK(num == 1);
+  CHECK(logHas("22 f1 a3"));
 
   shim().Disconnect(ch);
   shim().Close(device);

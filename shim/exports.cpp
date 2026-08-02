@@ -61,6 +61,7 @@ struct PeriodicMessage {
 // this read-side filter is a diagnostic fallback for drivers that ignore it.
 std::map<unsigned long, std::map<unsigned long, PeriodicMessage>> g_periodic;
 std::set<std::pair<unsigned long, unsigned long>> g_periodicSuppressionLogged;
+std::set<unsigned long> g_clearRxEmulationLogged;
 
 // RAII lock that tolerates being used before InitializeCriticalSection and
 // after DllMain has torn it down.
@@ -274,6 +275,16 @@ bool isActivePeriodicTxIndication(unsigned long channel,
 bool firstPeriodicSuppression(unsigned long channel, unsigned long canId) {
   Guard g;
   return g_periodicSuppressionLogged.insert({channel, canId}).second;
+}
+
+// SDA calls CLEAR_RX_BUFFER before every single request, so on a target that
+// refuses it the emulation is the normal path, not an event. One live flash
+// read produced 2150 of these lines - 99.5% of the log - which buries
+// everything worth reading. Announce it once per channel, then keep the rest at
+// trace.
+bool firstClearRxEmulation(unsigned long channel) {
+  Guard g;
+  return g_clearRxEmulationLogged.insert(channel).second;
 }
 
 // The pin-switched counterpart of a protocol, or 0 when there is none.
@@ -1124,6 +1135,7 @@ void forgetChannel(unsigned long channel) {
     else
       ++it;
   }
+  g_clearRxEmulationLogged.erase(channel);
   g_channels.erase(channel);
 }
 
@@ -1162,6 +1174,7 @@ void forgetDeviceChannels(unsigned long device) {
       else
         ++logged;
     }
+    g_clearRxEmulationLogged.erase(it->first);
     it = g_channels.erase(it);
     ++stale;
   }
@@ -1176,14 +1189,36 @@ void forgetDeviceChannels(unsigned long device) {
 // DataSize nor the ISO-TP 4095-byte limit can identify a safe chunk. Until the
 // proprietary stream contract is implemented, fail the entire active session
 // closed and never expose any of its chunks to the target driver.
-bool fabricateWriteSupported(unsigned long channel) {
-  if (!fabricateActive(channel))
+// A single ISO-TP message carries at most 4095 payload bytes; SDA prefixes the
+// 4-byte CAN identifier, so anything above this cannot be one message.
+constexpr unsigned long kMaxSingleIsoTpWrite = 4095 + 4;
+
+// Refuses only writes that cannot be one ISO-TP message.
+//
+// This deliberately does NOT block every write while fabricate mode is on, even
+// though a programming block could in principle be split across several
+// individually valid calls. The live trace settles it: SDA sets
+// ISO15765_SWDL_FABRICATE once, never clears it, and then runs ordinary UDS on
+// the same channel - two writes six seconds apart at 22:24:34 and 22:24:40, an
+// interactive pace, not a download stream. Blocking the whole session therefore
+// killed plain DID reads and wake commands. The mode is a channel setting SDA
+// leaves on, not a statement that a download is in progress.
+bool fabricateWriteSupported(unsigned long channel, const PASSTHRU_MSG *msgs,
+                             unsigned long count) {
+  if (!msgs || !fabricateActive(channel))
     return true;
-  SHIM_ERROR("FABRICATE: refusing WriteMsgs on channel %lu while the unsupported "
-             "DiCE ISO15765_SWDL_FABRICATE streaming mode is active; no payload "
-             "was forwarded",
-             channel);
-  return false;
+  for (unsigned long i = 0; i < count; ++i) {
+    if (msgs[i].DataSize <= kMaxSingleIsoTpWrite)
+      continue;
+    SHIM_ERROR("FABRICATE: WriteMsgs on channel %lu carries DataSize:%lu, larger "
+               "than one ISO-TP message (%lu). SDA expects the device to split "
+               "this into TransferData (0x36) frames - the shim does not do that "
+               "yet; refusing the write instead of forwarding a malformed "
+               "message.",
+               channel, msgs[i].DataSize, kMaxSingleIsoTpWrite);
+    return false;
+  }
+  return true;
 }
 
 bool allFunctionalBroadcasts(const PASSTHRU_MSG *msgs, unsigned long count) {
@@ -1598,11 +1633,11 @@ long WINAPI PassThruWriteMsgs(unsigned long ChannelID, void *pMsg,
       SHIM_TRACE("-->> PassThruWriteMsgs [ ChannelId:%lu ] %s", ChannelID,
                  formatMsg(msgs + i).c_str());
   }
-  if (!fabricateWriteSupported(ChannelID)) {
+  if (!fabricateWriteSupported(ChannelID, msgs, n)) {
     if (pNumMsgs)
       *pNumMsgs = 0;
     setLastError(SHIM_PRODUCT_NAME
-                 ": ISO15765_SWDL_FABRICATE streaming mode is unsupported");
+                 ": ISO15765_SWDL_FABRICATE oversized write is unsupported");
     return ERR_NOT_SUPPORTED;
   }
 
@@ -1946,10 +1981,17 @@ long WINAPI PassThruIoctl(unsigned long ChannelID, unsigned long IoctlID,
     if (r != STATUS_NOERROR && IoctlID == CLEAR_RX_BUFFER &&
         g_cfg.emulateClearRxBuffer) {
       const long drained = drainRxQueue(target, ChannelID, r);
-      if (drained == STATUS_NOERROR)
-        SHIM_INFO("CLEAR_RX_BUFFER: target answered %s, emulated by draining the "
-                  "queue instead",
-                  err2str(r));
+      if (drained == STATUS_NOERROR) {
+        if (firstClearRxEmulation(ChannelID))
+          SHIM_INFO("CLEAR_RX_BUFFER: target answered %s on channel %lu, "
+                    "emulating by draining the queue; further occurrences on "
+                    "this channel are logged at trace level only",
+                    err2str(r), ChannelID);
+        else
+          SHIM_TRACE("CLEAR_RX_BUFFER: target answered %s, emulated by draining "
+                     "the queue instead",
+                     err2str(r));
+      }
       r = drained;
     }
 
