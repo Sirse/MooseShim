@@ -1,0 +1,22 @@
+// Generated from cmake/product.h.in - do not edit.
+//
+// Every user-visible occurrence of the product name comes from here, so
+// renaming the shim is a single line in CMakeLists.txt. The name is not
+// cosmetic: it is the DLL filename, the INI filename beside it, the registry
+// key SDA enumerates and the tag in every log line, and those four have to
+// agree.
+
+#pragma once
+
+#define SHIM_PRODUCT_NAME "@SHIM_NAME@"
+#define SHIM_MODULE_NAME "@SHIM_NAME@.dll"
+#define SHIM_INI_NAME "@SHIM_NAME@.ini"
+// Overrides [target] library. Used by the tests to aim the shim at the mock
+// driver while the installed INI keeps pointing at the real adapter.
+#define SHIM_ENV_TARGET "@SHIM_NAME_UPPER@_TARGET"
+// Test-only route override; normal installations use the INI value.
+#define SHIM_ENV_D2_ROUTE "@SHIM_NAME_UPPER@_D2_ROUTE"
+
+#define SHIM_VERSION_STR "@SHIM_VERSION@"
+#define SHIM_AUTHOR "@SHIM_AUTHOR@"
+#define SHIM_COPYRIGHT "@SHIM_COPYRIGHT@"

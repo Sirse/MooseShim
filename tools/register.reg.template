@@ -1,0 +1,29 @@
+Windows Registry Editor Version 5.00
+
+; Register the shim as a J2534 device for 32-bit applications.
+; WOW6432Node is required because SDA is a 32-bit process.
+;
+; Copy this template to register.reg, replace @MOOSESHIM_DLL@ with the escaped
+; absolute DLL path, then import register.reg as Administrator.
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\PassThruSupport.04.04\MooseShim]
+"Name"="MooseShim"
+"Vendor"="github.com/Sirse/MooseShim"
+"FunctionLibrary"="@MOOSESHIM_DLL@"
+; ConfigApplication is empty; configuration is kept in MooseShim.ini.
+"ConfigApplication"=""
+
+; SDA lists entries in "DiCE compatible Hardware" only when this flag is set.
+"DiCECompatible"=dword:00000001
+
+; Match the channel counts used by the original SETEK DiCE entry.
+"CAN"=dword:00000002
+"ISO15765"=dword:00000002
+"ISO9141"=dword:00000001
+"J1850PWM"=dword:00000000
+"J1850VPW"=dword:00000000
+"ISO14230"=dword:00000000
+"SCI_A_ENGINE"=dword:00000000
+"SCI_A_TRANS"=dword:00000000
+"SCI_B_ENGINE"=dword:00000000
+"SCI_B_TRANS"=dword:00000000

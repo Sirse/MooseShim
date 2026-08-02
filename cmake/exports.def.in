@@ -1,0 +1,20 @@
+; Generated from cmake/exports.def.in - do not edit.
+;
+; Undecorated __stdcall exports. Without this file MSVC exports
+; _PassThruOpen@8 and SDA will not find the entry points.
+LIBRARY @SHIM_NAME@
+EXPORTS
+    PassThruOpen
+    PassThruClose
+    PassThruConnect
+    PassThruDisconnect
+    PassThruReadMsgs
+    PassThruWriteMsgs
+    PassThruStartPeriodicMsg
+    PassThruStopPeriodicMsg
+    PassThruStartMsgFilter
+    PassThruStopMsgFilter
+    PassThruSetProgrammingVoltage
+    PassThruReadVersion
+    PassThruGetLastError
+    PassThruIoctl

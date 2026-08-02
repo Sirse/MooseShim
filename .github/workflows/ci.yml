@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  pull_request:
+    paths:
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'shim/**'
+      - 'tests/**'
+      - 'mock/**'
+      - 'host/**'
+      - 'shim.ini'
+      - 'tools/register.reg.template'
+      - '.github/workflows/**'
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'shim/**'
+      - 'tests/**'
+      - 'mock/**'
+      - 'host/**'
+      - 'shim.ini'
+      - 'tools/register.reg.template'
+      - '.github/workflows/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S . -B build-ci -G "Visual Studio 17 2022" -A Win32
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build-ci --config Release --parallel
+
+      - name: Test
+        shell: pwsh
+        run: ctest --test-dir build-ci -C Release --output-on-failure

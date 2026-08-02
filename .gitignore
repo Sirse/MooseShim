@@ -1,0 +1,15 @@
+# Build output
+/build*/
+/out/
+cmake-build-*/
+
+# Local registry export with machine-specific DLL path
+/tools/register.reg
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+
+# Logs
+*.log
