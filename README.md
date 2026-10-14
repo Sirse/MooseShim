@@ -15,10 +15,12 @@ MooseShim does not modify SDA or the target J2534 driver.
 - Supported: ISO15765/UDS communication used by P3, SPA and related platforms.
 - Experimental: Volvo D2/DII translation over standard raw `CAN`/`CAN_PS`.
   It is disabled by default (`[channel] d2_route=reject`).
-- Unsupported: the proprietary DiCE `ISO15765_SWDL_FABRICATE` streaming mode.
-  Every write made while a fabrication session is active fails with
-  `ERR_NOT_SUPPORTED`; its chunks are never forwarded as ordinary ISO-TP
-  messages. This is independent of the size of an individual write.
+- Unsupported: payloads in the proprietary DiCE
+  `ISO15765_SWDL_FABRICATE` mode that exceed one ISO-TP message. Writes above
+  4095 payload bytes (plus the four-byte CAN identifier) fail with
+  `ERR_NOT_SUPPORTED` instead of being forwarded malformed. SDA leaves this
+  channel option enabled during ordinary UDS traffic, so normally sized writes
+  continue to use the standard ISO15765 path.
 
 ### Experimental D2/DII
 
@@ -54,6 +56,7 @@ Important compatibility options are documented directly in the INI:
 - `CLEAR_RX_BUFFER` emulation;
 - normalization of empty blocking reads;
 - handling of unacknowledged functional broadcasts;
+- unambiguous correction of SDA filter cleanup on the wrong bus channel;
 - logging level and path.
 
 Unknown IDs in the vendor range are absorbed by default. Do not disable this

@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 #include <windows.h>
@@ -27,11 +28,14 @@ struct ChannelState {
   unsigned long baud = 0;
   bool loopback = true;
   std::map<unsigned long, PASSTHRU_MSG> periodic;
+  std::set<unsigned long> filters;
+  unsigned long nextFilterId = 3;
 };
 std::map<unsigned long, ChannelState> g_channels;
 enum class MockMode : unsigned long { mongoose = 0, strict = 1, nativeDualCan = 2 };
 MockMode g_mode = MockMode::mongoose;
 long g_connectFailure = STATUS_NOERROR;
+volatile LONG g_writeReturnDelay = 0;
 
 // Messages the test has queued for PassThruReadMsgs to hand back, so the
 // receive direction of the shim's protocol translation can be observed.
@@ -173,7 +177,10 @@ long WINAPI PassThruReadMsgs(unsigned long ChannelID, void *pMsg,
   }
   const unsigned long capacity = pNumMsgs ? *pNumMsgs : 0UL;
   unsigned long delivered = 0;
-  while (delivered < capacity && !g_rx.empty() && pMsg) {
+  const bool receiveEnabled =
+      channel == g_channels.end() || channel->second.protocol == ISO15765 ||
+      channel->second.protocol == ISO15765_PS || !channel->second.filters.empty();
+  while (receiveEnabled && delivered < capacity && !g_rx.empty() && pMsg) {
     static_cast<PASSTHRU_MSG *>(pMsg)[delivered++] = g_rx.front();
     g_rx.erase(g_rx.begin());
   }
@@ -216,6 +223,9 @@ long WINAPI PassThruWriteMsgs(unsigned long ChannelID, void *pMsg,
     else
       queueTxIndication(ChannelID, *m);
   }
+  const LONG writeDelay = InterlockedCompareExchange(&g_writeReturnDelay, 0, 0);
+  if (writeDelay > 0)
+    Sleep(static_cast<DWORD>(writeDelay));
   if (unacknowledgedBroadcast) {
     if (pNumMsgs)
       *pNumMsgs = 0;
@@ -266,14 +276,29 @@ long WINAPI PassThruStartMsgFilter(unsigned long ChannelID, unsigned long Filter
                                    unsigned long *pMsgID) {
   record("StartMsgFilter channel=%lu type=%lu flow=%d", ChannelID, FilterType,
          pFlow ? 1 : 0);
+  ensureCs();
+  EnterCriticalSection(&g_cs);
+  const auto channel = g_channels.find(ChannelID);
+  unsigned long id = 0;
+  if (channel != g_channels.end()) {
+    id = channel->second.nextFilterId++;
+    channel->second.filters.insert(id);
+  }
+  LeaveCriticalSection(&g_cs);
   if (pMsgID)
-    *pMsgID = 3;
+    *pMsgID = id;
   return STATUS_NOERROR;
 }
 
 long WINAPI PassThruStopMsgFilter(unsigned long ChannelID, unsigned long MsgID) {
   record("StopMsgFilter channel=%lu msg=%lu", ChannelID, MsgID);
-  return STATUS_NOERROR;
+  ensureCs();
+  EnterCriticalSection(&g_cs);
+  const auto channel = g_channels.find(ChannelID);
+  const bool found = channel != g_channels.end() &&
+                     channel->second.filters.erase(MsgID) != 0;
+  LeaveCriticalSection(&g_cs);
+  return found ? STATUS_NOERROR : ERR_INVALID_FILTER_ID;
 }
 
 long WINAPI PassThruSetProgrammingVoltage(unsigned long DeviceID, unsigned long Pin,
@@ -310,6 +335,19 @@ long WINAPI PassThruIoctl(unsigned long ChannelID, unsigned long IoctlID, void *
   // up the difference.
   if (IoctlID == CLEAR_RX_BUFFER && g_mode == MockMode::mongoose)
     return ERR_FAILED;
+
+  if (IoctlID == CLEAR_PERIODIC_MSGS || IoctlID == CLEAR_MSG_FILTERS) {
+    ensureCs();
+    EnterCriticalSection(&g_cs);
+    const auto channel = g_channels.find(ChannelID);
+    if (channel != g_channels.end()) {
+      if (IoctlID == CLEAR_PERIODIC_MSGS)
+        channel->second.periodic.clear();
+      else
+        channel->second.filters.clear();
+    }
+    LeaveCriticalSection(&g_cs);
+  }
 
   if ((IoctlID == SET_CONFIG || IoctlID == GET_CONFIG) && pInput) {
     SCONFIG_LIST *l = static_cast<SCONFIG_LIST *>(pInput);
@@ -353,6 +391,7 @@ long WINAPI MockGetCallLog(char *pBuffer, unsigned long *pSize) {
 }
 
 long WINAPI MockReset(void) {
+  InterlockedExchange(&g_writeReturnDelay, 0);
   ensureCs();
   EnterCriticalSection(&g_cs);
   g_log.clear();
@@ -363,6 +402,11 @@ long WINAPI MockReset(void) {
 }
 
 // 0=Mongoose quirks, 1=strict v04.04, 2=native second CAN channel.
+long WINAPI MockSetWriteReturnDelay(unsigned long milliseconds) {
+  InterlockedExchange(&g_writeReturnDelay, static_cast<LONG>(milliseconds));
+  return STATUS_NOERROR;
+}
+
 long WINAPI MockSetMode(unsigned long mode) {
   if (mode > static_cast<unsigned long>(MockMode::nativeDualCan))
     return ERR_INVALID_IOCTL_ID;

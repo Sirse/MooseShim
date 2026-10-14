@@ -10,6 +10,8 @@
 #include <cstring>
 #include <initializer_list>
 #include <string>
+#include <thread>
+#include <chrono>
 #include <vector>
 #include <windows.h>
 
@@ -103,9 +105,15 @@ std::string callLog() {
   const Api &a = api();
   unsigned long size = 0;
   a.callLog(nullptr, &size);
-  std::vector<char> buffer(size, 0);
-  a.callLog(buffer.data(), &size);
-  return std::string(buffer.data());
+  for (int attempt = 0; attempt < 8; ++attempt) {
+    std::vector<char> buffer(size, 0);
+    const long status = a.callLog(buffer.data(), &size);
+    if (status == STATUS_NOERROR)
+      return std::string(buffer.data());
+    REQUIRE(status == ERR_BUFFER_FULL);
+  }
+  FAIL("mock call log kept growing during eight snapshot attempts");
+  return {};
 }
 
 void pushFrame(const Api &a, uint32_t canId, const shim::d2::D2CanFrame &frame) {
@@ -155,6 +163,33 @@ PASSTHRU_MSG readOne(const Api &a, unsigned long channel,
   REQUIRE(count == 1);
   return result;
 }
+
+size_t occurrences(const std::string &text, const std::string &term) {
+  size_t count = 0;
+  size_t offset = 0;
+  while ((offset = text.find(term, offset)) != std::string::npos) {
+    ++count;
+    offset += term.size();
+  }
+  return count;
+}
+
+struct D2Session {
+  const Api &a = api();
+  unsigned long device = 0;
+  unsigned long channel = 0;
+
+  D2Session() {
+    REQUIRE(a.reset() == STATUS_NOERROR);
+    REQUIRE(a.open(nullptr, &device) == STATUS_NOERROR);
+    REQUIRE(a.connect(device, j2534::dice::CAN_XON_XOFF_STMIN, CAN_29BIT_ID,
+                      500000, &channel) == STATUS_NOERROR);
+  }
+  ~D2Session() {
+    a.disconnect(channel);
+    a.close(device);
+  }
+};
 
 } // namespace
 
@@ -578,4 +613,98 @@ TEST_CASE("D2 CLEAR_RX_BUFFER clears shim-owned receive state") {
 
   CHECK(a.disconnect(channel) == STATUS_NOERROR);
   CHECK(a.close(device) == STATUS_NOERROR);
+}
+
+TEST_CASE("D2 connect installs a target receive filter") {
+  D2Session session;
+  CHECK(callLog().find("StartMsgFilter") != std::string::npos);
+}
+
+TEST_CASE("D2 CLEAR_PERIODIC_MSGS stops shim schedulers") {
+  D2Session session;
+  PASSTHRU_MSG periodic = message(
+      j2534::dice::CAN_XON_XOFF_STMIN,
+      {0x00, 0x0F, 0xFF, 0xFE, 0xFF, 0x86, 0, 0, 0, 0, 0, 0});
+  unsigned long id = 0;
+  REQUIRE(session.a.startPeriodic(session.channel, &periodic, &id, 20) ==
+          STATUS_NOERROR);
+  Sleep(60);
+  REQUIRE(session.a.ioctl(session.channel, CLEAR_PERIODIC_MSGS, nullptr, nullptr) ==
+          STATUS_NOERROR);
+  const size_t before = occurrences(callLog(), "WriteMsgs");
+  Sleep(80);
+  CHECK(occurrences(callLog(), "WriteMsgs") == before);
+  CHECK(session.a.stopPeriodic(session.channel, id) == ERR_INVALID_MSG_ID);
+}
+
+TEST_CASE("D2 CLEAR_MSG_FILTERS invalidates logical filters") {
+  D2Session session;
+  PASSTHRU_MSG mask = message(j2534::dice::CAN_XON_XOFF_STMIN,
+                              {0xFF, 0xFF, 0xFF, 0xFF});
+  PASSTHRU_MSG pattern = message(j2534::dice::CAN_XON_XOFF_STMIN,
+                                 {0x00, 0x00, 0x00, 0x03});
+  unsigned long id = 0;
+  REQUIRE(session.a.startFilter(session.channel, PASS_FILTER, &mask, &pattern,
+                                nullptr, &id) == STATUS_NOERROR);
+  REQUIRE(session.a.ioctl(session.channel, CLEAR_MSG_FILTERS, nullptr, nullptr) ==
+          STATUS_NOERROR);
+  CHECK(session.a.stopFilter(session.channel, id) == ERR_INVALID_FILTER_ID);
+  CHECK(occurrences(callLog(), "StartMsgFilter") == 2);
+}
+
+TEST_CASE("blocking D2 reads do not starve scheduled writes") {
+  D2Session session;
+  PASSTHRU_MSG periodic = message(
+      j2534::dice::CAN_XON_XOFF_STMIN,
+      {0x00, 0x0F, 0xFF, 0xFE, 0xFF, 0x86, 0, 0, 0, 0, 0, 0});
+  unsigned long id = 0;
+  REQUIRE(session.a.startPeriodic(session.channel, &periodic, &id, 20) ==
+          STATUS_NOERROR);
+  Sleep(40);
+  std::thread reader([&] {
+    PASSTHRU_MSG rx = {};
+    unsigned long count = 1;
+    session.a.read(session.channel, &rx, &count, 250);
+  });
+  const size_t before = occurrences(callLog(), "WriteMsgs");
+  Sleep(100);
+  const size_t after = occurrences(callLog(), "WriteMsgs");
+  reader.join();
+  REQUIRE(session.a.stopPeriodic(session.channel, id) == STATUS_NOERROR);
+  CHECK(after > before);
+}
+
+TEST_CASE("D2 STmin respects the WriteMsgs deadline") {
+  D2Session session;
+  PASSTHRU_MSG tx = message(j2534::dice::CAN_XON_XOFF_STMIN,
+                            {0, 0, 0, 3, 0x40, 0xB9});
+  SCONFIG stmin = {j2534::dice::CAN_XON_XOFF_STMIN, 200};
+  SCONFIG_LIST list = {1, &stmin};
+  REQUIRE(session.a.ioctl(session.channel, SET_CONFIG, &list, nullptr) ==
+          STATUS_NOERROR);
+  unsigned long count = 1;
+  REQUIRE(session.a.write(session.channel, &tx, &count, 1000) == STATUS_NOERROR);
+  const auto begin = std::chrono::steady_clock::now();
+  count = 1;
+  CHECK(session.a.write(session.channel, &tx, &count, 10) == ERR_TIMEOUT);
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - begin);
+  CHECK(elapsed < std::chrono::milliseconds(100));
+  CHECK(count == 0);
+}
+
+TEST_CASE("D2 raw response lifetime is independent of write timeout") {
+  D2Session session;
+  PASSTHRU_MSG tx = message(j2534::dice::CAN_XON_XOFF_STMIN,
+                            {0, 0, 0, 3, 0x40, 0xB9});
+  tx.TxFlags = j2534::dice::CAN_FRAME_RAW;
+  unsigned long count = 1;
+  REQUIRE(session.a.write(session.channel, &tx, &count, 10) == STATUS_NOERROR);
+  Sleep(25);
+  const unsigned char response[] = {0, 0, 0, 3, 0x40, 0xB9};
+  REQUIRE(session.a.pushRx(CAN, response, sizeof(response)) == STATUS_NOERROR);
+  PASSTHRU_MSG rx = {};
+  count = 1;
+  CHECK(session.a.read(session.channel, &rx, &count, 30) == STATUS_NOERROR);
+  CHECK(count == 1);
 }

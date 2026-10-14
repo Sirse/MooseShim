@@ -46,12 +46,14 @@ TEST_CASE("adapter profiles apply defaults and preserve explicit overrides") {
       "ms_fallback=1\n"
       "emulate_clear_rx_buffer=1\n"
       "tolerate_unacked_functional_broadcasts=1\n"
-      "normalize_empty_blocking_read=1\n");
+      "normalize_empty_blocking_read=1\n"
+      "repair_cross_channel_filter_stop=1\n");
   CHECK(generic.adapterProfile == shim::AdapterProfile::generic);
   CHECK(generic.msFallback);
   CHECK(generic.emulateClearRxBuffer);
   CHECK(generic.tolerateUnackedFunctionalBroadcasts);
   CHECK(generic.normalizeEmptyBlockingRead);
+  CHECK(generic.repairCrossChannelFilterStop);
 
   const shim::Config mongoose = loadIni(
       "[target]\n"
@@ -61,6 +63,7 @@ TEST_CASE("adapter profiles apply defaults and preserve explicit overrides") {
   CHECK(mongoose.emulateClearRxBuffer);
   CHECK(mongoose.tolerateUnackedFunctionalBroadcasts);
   CHECK(mongoose.normalizeEmptyBlockingRead);
+  CHECK(mongoose.repairCrossChannelFilterStop);
 
   const shim::Config automatic = loadIni(
       "[target]\n"
@@ -70,4 +73,5 @@ TEST_CASE("adapter profiles apply defaults and preserve explicit overrides") {
   CHECK(automatic.emulateClearRxBuffer);
   CHECK_FALSE(automatic.tolerateUnackedFunctionalBroadcasts);
   CHECK(automatic.normalizeEmptyBlockingRead);
+  CHECK_FALSE(automatic.repairCrossChannelFilterStop);
 }

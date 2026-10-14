@@ -131,6 +131,7 @@ struct D2ChannelState {
   unsigned long baudRate = 0;
   unsigned long hostFlags = 0;
   unsigned long targetFlags = 0;
+  unsigned long targetReceiveFilterId = 0;
   unsigned long pins = 0;
   unsigned long samplePoint = 0;
   uint32_t stMin = 0;
@@ -155,6 +156,9 @@ struct D2ChannelState {
     std::string message;
   };
   std::deque<DeferredError> deferredErrors;
+  // Host readers are serialized; target reads run in short slices under mutex.
+  // This also serializes the TX-ack reader without starving periodic writes.
+  mutable std::mutex readMutex;
   mutable std::mutex mutex;
 };
 

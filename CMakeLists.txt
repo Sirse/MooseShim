@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(SDAShim CXX)
+project(MooseShim CXX)
 
 # --- product identity --------------------------------------------------------
 # SHIM_NAME is the DLL filename, the INI filename beside it, the registry key

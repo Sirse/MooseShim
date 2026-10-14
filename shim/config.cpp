@@ -117,6 +117,7 @@ void applyAdapterProfile(Config *cfg) {
     cfg->emulateClearRxBuffer = false;
     cfg->tolerateUnackedFunctionalBroadcasts = false;
     cfg->normalizeEmptyBlockingRead = false;
+    cfg->repairCrossChannelFilterStop = false;
     return;
   }
 
@@ -130,6 +131,8 @@ void applyAdapterProfile(Config *cfg) {
   cfg->tolerateUnackedFunctionalBroadcasts =
       cfg->adapterProfile == AdapterProfile::mongoose;
   cfg->normalizeEmptyBlockingRead = true;
+  cfg->repairCrossChannelFilterStop =
+      cfg->adapterProfile == AdapterProfile::mongoose;
 }
 
 } // namespace
@@ -160,6 +163,7 @@ Config Config::load(const std::string &iniPath, std::string *error) {
   bool emulateClearSet = false;
   bool tolerateUnackedSet = false;
   bool normalizeEmptySet = false;
+  bool repairFilterStopSet = false;
   // Defaults matching the specification: both DiCE vendor SET_CONFIG
   // parameters are absorbed.
   cfg.intercept["ISO15765_SWDL_FABRICATE"] = Policy::absorb;
@@ -241,6 +245,9 @@ Config Config::load(const std::string &iniPath, std::string *error) {
       } else if (k == "normalize_empty_blocking_read") {
         cfg.normalizeEmptyBlockingRead = parseBool(value);
         normalizeEmptySet = true;
+      } else if (k == "repair_cross_channel_filter_stop") {
+        cfg.repairCrossChannelFilterStop = parseBool(value);
+        repairFilterStopSet = true;
       }
       else
         cfg.warnings.push_back("unknown key [channel] " + key + " - ignored");
@@ -294,6 +301,7 @@ Config Config::load(const std::string &iniPath, std::string *error) {
   const bool emulateClear = cfg.emulateClearRxBuffer;
   const bool tolerateUnacked = cfg.tolerateUnackedFunctionalBroadcasts;
   const bool normalizeEmpty = cfg.normalizeEmptyBlockingRead;
+  const bool repairFilterStop = cfg.repairCrossChannelFilterStop;
   applyAdapterProfile(&cfg);
   if (explicitMsFallback)
     cfg.msFallback = msFallback;
@@ -303,6 +311,8 @@ Config Config::load(const std::string &iniPath, std::string *error) {
     cfg.tolerateUnackedFunctionalBroadcasts = tolerateUnacked;
   if (explicitNormalizeEmpty)
     cfg.normalizeEmptyBlockingRead = normalizeEmpty;
+  if (repairFilterStopSet)
+    cfg.repairCrossChannelFilterStop = repairFilterStop;
   if (!overrideLibrary.empty())
     cfg.library = overrideLibrary;
   return cfg;

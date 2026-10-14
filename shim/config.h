@@ -78,6 +78,11 @@ struct Config {
   // Non-blocking reads (Timeout == 0) retain ERR_BUFFER_EMPTY.
   bool normalizeEmptyBlockingRead = true;
 
+  // SDA can close a FLOW_CONTROL_FILTER using the other bus channel. J2534
+  // filter ids are channel-scoped, so repair that call only when exactly one
+  // active filter with the supplied id exists on the same device.
+  bool repairCrossChannelFilterStop = false;
+
   // [log]
   std::string logPath;
   std::string logLevel = "debug";

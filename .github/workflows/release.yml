@@ -58,7 +58,7 @@ jobs:
         shell: pwsh
         run: |
           $packageDir = 'package'
-          $archive = "dist/SDAShim-$env:GITHUB_REF_NAME.zip"
+          $archive = "dist/$env:SHIM_NAME-$env:GITHUB_REF_NAME.zip"
           New-Item -ItemType Directory -Force -Path "$packageDir/tools", 'dist' | Out-Null
 
           Copy-Item "build-release/Release/$env:SHIM_NAME.dll" $packageDir
@@ -74,7 +74,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create $env:GITHUB_REF_NAME `
-            "dist/SDAShim-$env:GITHUB_REF_NAME.zip" `
+            "dist/$env:SHIM_NAME-$env:GITHUB_REF_NAME.zip" `
             --verify-tag `
             --title $env:GITHUB_REF_NAME `
             --generate-notes

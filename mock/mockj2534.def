@@ -19,3 +19,4 @@ EXPORTS
     MockSetMode
     MockSetConnectFailure
     MockPushRx
+    MockSetWriteReturnDelay

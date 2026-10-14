@@ -48,20 +48,23 @@ INIT_ONCE g_initOnce = INIT_ONCE_STATIC_INIT;
 CRITICAL_SECTION g_lock;
 volatile LONG g_lockReady = 0;
 std::string g_lastError; // empty == defer to the target driver
-std::set<unsigned long> g_fabricateChannels;
 struct PeriodicMessage {
   unsigned long protocol;
   unsigned long canId;
   std::shared_ptr<class D2PeriodicScheduler> scheduler;
+  std::vector<unsigned char> payload;
 };
-// Suppression is keyed by the target protocol and CAN ID, not payload. A
-// periodic echo and a normal request to the same ECU endpoint are therefore
-// treated as the same target-owned TX indication class by design.
+// ID-only indications cannot distinguish periodic and ordinary writes. Preserve
+// one indication per successful ordinary write before suppressing periodic echoes.
 // LOOPBACK=0 is the primary defense and is applied during channel setup;
 // this read-side filter is a diagnostic fallback for drivers that ignore it.
-std::map<unsigned long, std::map<unsigned long, PeriodicMessage>> g_periodic;
-std::set<std::pair<unsigned long, unsigned long>> g_periodicSuppressionLogged;
-std::set<unsigned long> g_clearRxEmulationLogged;
+struct OrdinaryTx {
+  unsigned long protocol;
+  unsigned long canId;
+  ULONGLONG expires;
+  unsigned long long token = 0;
+  unsigned long index = 0;
+};
 
 // RAII lock that tolerates being used before InitializeCriticalSection and
 // after DllMain has torn it down.
@@ -149,8 +152,6 @@ const char *err2str(long code) { return errorName(code); }
 
 // --- vendor bits inside flag words ------------------------------------------
 
-bool channelFunctional(unsigned long channel);
-
 bool isFunctionalBroadcast(const PASSTHRU_MSG &msg) {
   if ((msg.ProtocolID != ISO15765 && msg.ProtocolID != ISO15765_PS) ||
       msg.DataSize < 4)
@@ -167,26 +168,17 @@ bool isFunctionalBroadcast(const PASSTHRU_MSG &msg) {
 // buffer is left exactly as it was found.
 class TxFlagScrubber {
 public:
-  TxFlagScrubber(unsigned long channel, PASSTHRU_MSG *msgs, unsigned long count,
-                 const char *fn, bool applyChannelAddressing = true)
+  TxFlagScrubber(PASSTHRU_MSG *msgs, unsigned long count, const char *fn)
       : msgs_(msgs) {
     if (!msgs)
       return;
-    const bool functionalChannel =
-        applyChannelAddressing && channelFunctional(channel);
     for (unsigned long i = 0; i < count; ++i) {
       unsigned long removed = 0;
       unsigned long clean = filterTxFlags(g_cfg, msgs[i].TxFlags, &removed);
-      // A FUNC_ADDR bit on the individual message is authoritative. The same
-      // bit on PassThruConnect only describes the channel's intended use; SDA
-      // also sends physical requests (for example to 0x736) through that
-      // channel, so only infer functional addressing for the 0x7DF broadcast.
-      const bool functionalMessage =
-          (msgs[i].TxFlags & j2534::dice::FUNC_ADDR) != 0 ||
-          (functionalChannel && isFunctionalBroadcast(msgs[i]));
-      if (functionalMessage &&
-          (msgs[i].ProtocolID == ISO15765 || msgs[i].ProtocolID == ISO15765_PS))
-        clean |= ISO15765_ADDR_TYPE;
+      // FUNC_ADDR describes DiCE functional routing. ISO15765_ADDR_TYPE is a
+      // different wire-format option: it inserts an extended-address byte.
+      // Strip the vendor bit, but preserve ISO15765_ADDR_TYPE only when the
+      // caller explicitly supplied the standard flag.
       if (!removed && clean == msgs[i].TxFlags)
         continue;
       if (removed)
@@ -216,15 +208,124 @@ private:
 // Channels whose protocol id was rewritten on the way to the target. SDA keeps
 // talking in terms of the protocol it asked for, so every message crossing the
 // boundary has to be translated back and forth.
-struct ChannelMap {
+struct ChannelState {
   unsigned long device;
   unsigned long hostProtocol;
   unsigned long targetProtocol;
-  bool functional;
   bool d2 = false;
   std::shared_ptr<d2::D2ChannelState> d2State;
+  bool fabricate = false;
+  bool clearRxLogged = false;
+  std::map<unsigned long, PeriodicMessage> periodic;
+  std::deque<OrdinaryTx> ordinaryTx;
+  std::set<unsigned long> filterOwners;
+  std::set<unsigned long> suppressionLogged;
 };
-std::map<unsigned long, ChannelMap> g_channels;
+std::map<unsigned long, ChannelState> g_channels;
+
+class OrdinaryTxReservation {
+public:
+  OrdinaryTxReservation(unsigned long channel, const PASSTHRU_MSG *msgs,
+                         unsigned long count) : channel_(channel) {
+    Guard g;
+    static unsigned long long nextToken = 1;
+    token_ = nextToken++;
+    const auto it = g_channels.find(channel);
+    if (it == g_channels.end() || !msgs)
+      return;
+    auto &state = it->second;
+    const ULONGLONG now = GetTickCount64();
+    state.ordinaryTx.erase(std::remove_if(state.ordinaryTx.begin(), state.ordinaryTx.end(),
+        [now](const OrdinaryTx &tx) { return now >= tx.expires; }), state.ordinaryTx.end());
+    constexpr size_t kMaxOrdinaryTx = 256;
+    for (unsigned long i = 0; i < count; ++i) {
+      if (msgs[i].DataSize < 4)
+        continue;
+      const unsigned long id = (static_cast<unsigned long>(msgs[i].Data[0]) << 24) |
+          (static_cast<unsigned long>(msgs[i].Data[1]) << 16) |
+          (static_cast<unsigned long>(msgs[i].Data[2]) << 8) | msgs[i].Data[3];
+      if (!std::any_of(state.periodic.begin(), state.periodic.end(),
+          [&msgs, i, id](const auto &entry) {
+            return entry.second.protocol == msgs[i].ProtocolID && entry.second.canId == id;
+          }))
+        continue;
+      if (state.ordinaryTx.size() == kMaxOrdinaryTx)
+        state.ordinaryTx.pop_front();
+      state.ordinaryTx.push_back({msgs[i].ProtocolID, id, now + 10000, token_, i});
+    }
+  }
+  ~OrdinaryTxReservation() { finish(0); }
+  void finish(unsigned long accepted) {
+    if (!token_)
+      return;
+    Guard g;
+    const auto it = g_channels.find(channel_);
+    if (it != g_channels.end()) {
+      auto &pending = it->second.ordinaryTx;
+      pending.erase(std::remove_if(pending.begin(), pending.end(),
+          [this, accepted](const OrdinaryTx &tx) {
+            return tx.token == token_ && tx.index >= accepted;
+          }), pending.end());
+    }
+    token_ = 0;
+  }
+private:
+  unsigned long channel_;
+  unsigned long long token_ = 0;
+};
+// Target J2534 filter ids are scoped to a channel. SDA occasionally supplies
+// the other bus channel to StopMsgFilter, so retain ownership for a narrowly
+// gated compatibility correction.
+
+void rememberFilter(unsigned long channel, unsigned long filterId) {
+  Guard g;
+  const auto it = g_channels.find(channel);
+  if (it != g_channels.end())
+    it->second.filterOwners.insert(filterId);
+}
+
+void forgetFilter(unsigned long channel, unsigned long filterId) {
+  Guard g;
+  const auto channelIt = g_channels.find(channel);
+  if (channelIt == g_channels.end())
+    return;
+  channelIt->second.filterOwners.erase(filterId);
+}
+
+enum class FilterOwnerLookup { none, exact, uniqueOther, ambiguous };
+
+FilterOwnerLookup findFilterOwner(unsigned long requestedChannel,
+                                  unsigned long filterId,
+                                  unsigned long *ownerChannel) {
+  Guard g;
+  const auto requested = g_channels.find(requestedChannel);
+  if (requested == g_channels.end())
+    return FilterOwnerLookup::none;
+  if (requested->second.filterOwners.count(filterId)) {
+    *ownerChannel = requestedChannel;
+    return FilterOwnerLookup::exact;
+  }
+
+  unsigned long match = 0;
+  size_t matches = 0;
+  for (const auto &entry : g_channels) {
+    if (!entry.second.filterOwners.count(filterId))
+      continue;
+    const auto channel = g_channels.find(entry.first);
+    if (channel == g_channels.end() ||
+        channel->second.device != requested->second.device)
+      continue;
+    match = entry.first;
+    ++matches;
+  }
+  if (matches == 0)
+    return FilterOwnerLookup::none;
+  if (matches > 1)
+    return FilterOwnerLookup::ambiguous;
+  *ownerChannel = match;
+  return match == requestedChannel ? FilterOwnerLookup::exact
+                                   : FilterOwnerLookup::uniqueOther;
+}
 
 std::shared_ptr<d2::D2ChannelState> d2ChannelSnapshot(unsigned long channel) {
   Guard g;
@@ -232,12 +333,6 @@ std::shared_ptr<d2::D2ChannelState> d2ChannelSnapshot(unsigned long channel) {
   if (it == g_channels.end() || !it->second.d2)
     return {};
   return it->second.d2State;
-}
-
-bool channelFunctional(unsigned long channel) {
-  Guard g;
-  const auto it = g_channels.find(channel);
-  return it != g_channels.end() && it->second.functional;
 }
 
 bool isTranslated(unsigned long channel) {
@@ -261,12 +356,31 @@ bool isActivePeriodicTxIndication(unsigned long channel,
     return false;
   const unsigned long id = messageCanId(msg);
   Guard g;
-  const auto channelIt = g_periodic.find(channel);
-  if (channelIt == g_periodic.end())
+  const auto channelIt = g_channels.find(channel);
+  if (channelIt == g_channels.end())
     return false;
-  for (const auto &entry : channelIt->second) {
+  {
+    auto &pending = channelIt->second.ordinaryTx;
+    const ULONGLONG now = GetTickCount64();
+    pending.erase(std::remove_if(pending.begin(), pending.end(),
+                                 [now](const OrdinaryTx &tx) {
+                                   return now >= tx.expires;
+                                 }), pending.end());
+    const auto match = std::find_if(pending.begin(), pending.end(),
+                                   [&msg, id](const OrdinaryTx &tx) {
+      return tx.protocol == msg.ProtocolID && tx.canId == id;
+    });
+    if (match != pending.end()) {
+      pending.erase(match);
+      return false;
+    }
+  }
+  for (const auto &entry : channelIt->second.periodic) {
     const PeriodicMessage &periodic = entry.second;
-    if (periodic.protocol == msg.ProtocolID && periodic.canId == id)
+    if (periodic.protocol == msg.ProtocolID && periodic.canId == id &&
+        (msg.DataSize == 4 ||
+         (msg.DataSize == periodic.payload.size() &&
+          std::equal(periodic.payload.begin(), periodic.payload.end(), msg.Data))))
       return true;
   }
   return false;
@@ -274,7 +388,8 @@ bool isActivePeriodicTxIndication(unsigned long channel,
 
 bool firstPeriodicSuppression(unsigned long channel, unsigned long canId) {
   Guard g;
-  return g_periodicSuppressionLogged.insert({channel, canId}).second;
+  const auto it = g_channels.find(channel);
+  return it != g_channels.end() && it->second.suppressionLogged.insert(canId).second;
 }
 
 // SDA calls CLEAR_RX_BUFFER before every single request, so on a target that
@@ -284,7 +399,11 @@ bool firstPeriodicSuppression(unsigned long channel, unsigned long canId) {
 // trace.
 bool firstClearRxEmulation(unsigned long channel) {
   Guard g;
-  return g_clearRxEmulationLogged.insert(channel).second;
+  const auto it = g_channels.find(channel);
+  if (it == g_channels.end() || it->second.clearRxLogged)
+    return false;
+  it->second.clearRxLogged = true;
+  return true;
 }
 
 // The pin-switched counterpart of a protocol, or 0 when there is none.
@@ -426,6 +545,25 @@ PASSTHRU_MSG makeD2TargetMessage(const d2::D2CanFrame &frame,
   return result;
 }
 
+long installD2ReceiveFilter(const Target &target,
+                            const std::shared_ptr<d2::D2ChannelState> &state) {
+  PASSTHRU_MSG mask = {};
+  PASSTHRU_MSG pattern = {};
+  mask.ProtocolID = pattern.ProtocolID = state->targetProtocol;
+  mask.TxFlags = pattern.TxFlags = CAN_29BIT_ID;
+  mask.DataSize = pattern.DataSize = 4;
+  unsigned long filterId = 0;
+  const long r = target.StartMsgFilter(state->channelId, PASS_FILTER, &mask,
+                                       &pattern, nullptr, &filterId);
+  if (r != STATUS_NOERROR) {
+    setD2TargetError(target, "receive filter setup", r);
+    return r;
+  }
+  state->targetReceiveFilterId = filterId;
+  SHIM_TRACE("D2 target receive PASS_FILTER %lu installed", filterId);
+  return STATUS_NOERROR;
+}
+
 // J2534 periodic registration cannot represent a logical message that expands
 // to multiple wire frames. This worker owns that registration and sends one
 // complete D2 sequence per requested interval. It is stopped and joined on
@@ -534,9 +672,9 @@ unsigned long allocateShimPeriodicId() {
   for (;;) {
     const unsigned long candidate = nextId++;
     if (candidate != 0 &&
-        std::none_of(g_periodic.begin(), g_periodic.end(),
+        std::none_of(g_channels.begin(), g_channels.end(),
                      [candidate](const auto &channel) {
-                       return channel.second.count(candidate) != 0;
+                       return channel.second.periodic.count(candidate) != 0;
                      }))
       return candidate;
   }
@@ -545,24 +683,20 @@ unsigned long allocateShimPeriodicId() {
 void removePeriodicRegistration(unsigned long channelId,
                                 unsigned long messageId) {
   Guard g;
-  const auto channel = g_periodic.find(channelId);
-  if (channel == g_periodic.end())
+  const auto channel = g_channels.find(channelId);
+  if (channel == g_channels.end())
     return;
-  const auto periodic = channel->second.find(messageId);
-  if (periodic == channel->second.end())
+  auto &registrations = channel->second.periodic;
+  const auto periodic = registrations.find(messageId);
+  if (periodic == registrations.end())
     return;
   const unsigned long canId = periodic->second.canId;
-  channel->second.erase(periodic);
-  if (channel->second.empty()) {
-    g_periodic.erase(channel);
-    g_periodicSuppressionLogged.erase({channelId, canId});
-    return;
-  }
-  if (std::none_of(channel->second.begin(), channel->second.end(),
+  registrations.erase(periodic);
+  if (std::none_of(registrations.begin(), registrations.end(),
                    [canId](const auto &entry) {
                      return entry.second.canId == canId;
                    }))
-    g_periodicSuppressionLogged.erase({channelId, canId});
+    channel->second.suppressionLogged.erase(canId);
 }
 
 d2::D2PendingRx pendingD2Message(const PASSTHRU_MSG &message) {
@@ -661,13 +795,20 @@ void clearD2RxState(const std::shared_ptr<d2::D2ChannelState> &state) {
   state->deferredErrors.clear();
 }
 
-void waitForD2Frame(const d2::D2Timing &timing) {
-  const auto deadline = timing.nextFrameTime();
+bool waitForD2Frame(const d2::D2Timing &timing,
+                    std::chrono::steady_clock::time_point operationDeadline,
+                    bool mayWait) {
+  const auto frameDeadline = timing.nextFrameTime();
+  const auto initialNow = std::chrono::steady_clock::now();
+  if (frameDeadline <= initialNow)
+    return true;
+  if (!mayWait || frameDeadline > operationDeadline)
+    return false;
   for (;;) {
     const auto now = std::chrono::steady_clock::now();
-    if (now >= deadline)
-      return;
-    const auto remaining = deadline - now;
+    if (now >= frameDeadline)
+      return true;
+    const auto remaining = frameDeadline - now;
     if (remaining > std::chrono::milliseconds(2))
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     else
@@ -726,7 +867,10 @@ long d2WriteMsgs(const Target &target,
                    frames.size());
         return ERR_TIMEOUT;
       }
-      waitForD2Frame(state->timing);
+      if (!waitForD2Frame(state->timing, deadline, timeout != 0)) {
+        SHIM_ERROR("D2 target write timed out while waiting for STmin");
+        return ERR_TIMEOUT;
+      }
       PASSTHRU_MSG wire = makeD2TargetMessage(
           frames[frameIndex], state->targetProtocol, targetTxFlags);
       unsigned long one = 1;
@@ -760,11 +904,12 @@ long d2WriteMsgs(const Target &target,
       }
     }
     if (rawRequested) {
+      // A write timeout bounds transmission only. Keep the response contract
+      // alive independently so a short successful write cannot discard a
+      // response before the following ReadMsgs call begins.
       state->rawExpectations.push_back(
-          {logical.canId, timeout == 0
-                              ? std::chrono::steady_clock::now() +
-                                    std::chrono::seconds(1)
-                              : deadline});
+          {logical.canId, std::chrono::steady_clock::now() +
+                              std::chrono::seconds(10)});
     }
     ++*pNumMsgs;
   }
@@ -816,8 +961,7 @@ long d2ReadMsgs(const Target &target,
 
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(timeout);
-  // D2 is serialized per channel: a blocking target read owns this channel's
-  // transport state until its deadline. Other channels remain independent.
+  std::unique_lock<std::mutex> readLock(state->readMutex);
   std::unique_lock<std::mutex> lock(state->mutex);
   if (!state->deferredErrors.empty()) {
     // A message that became available after the hard error still has priority
@@ -889,7 +1033,11 @@ long d2ReadMsgs(const Target &target,
                                                     .count());
       PASSTHRU_MSG raw = {};
       unsigned long one = 1;
-      r = target.ReadMsgs(state->channelId, &raw, &one, remaining);
+      // All target readers (host RX and intermediate TX ack) own state->mutex.
+      // Bound each vendor wait so writes and keepalives get a chance between
+      // slices; no second reader can steal a frame while the mutex is released.
+      r = target.ReadMsgs(state->channelId, &raw, &one,
+                          std::min<unsigned long>(remaining, 5));
       if (r != STATUS_NOERROR && r != ERR_TIMEOUT && r != ERR_BUFFER_EMPTY) {
         char targetError[80] = {};
         if (target.GetLastError_)
@@ -917,6 +1065,9 @@ long d2ReadMsgs(const Target &target,
           }
           return received ? STATUS_NOERROR : ERR_TIMEOUT;
         }
+        lock.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        lock.lock();
         continue;
       }
       pending = pendingD2Message(raw);
@@ -1068,6 +1219,9 @@ long drainRxQueue(const Target &target, unsigned long channel, long targetStatus
 
   std::vector<PASSTHRU_MSG> batch(kBatch);
   unsigned long drained = 0;
+  const ULONGLONG started = GetTickCount64();
+  unsigned long txCount = 0;
+  std::map<std::pair<unsigned long, unsigned long>, unsigned long> endpoints;
   for (int round = 0; round < kMaxRounds; ++round) {
     unsigned long n = kBatch;
     // Timeout 0: return whatever is already buffered, do not wait for traffic.
@@ -1079,6 +1233,13 @@ long drainRxQueue(const Target &target, unsigned long channel, long targetStatus
       return targetStatus;
     }
     drained += n;
+    for (unsigned long i = 0; i < std::min(n, kBatch); ++i) {
+      if (batch[i].RxStatus & TX_MSG_TYPE)
+        ++txCount;
+      ++endpoints[{batch[i].ProtocolID, messageCanId(batch[i])}];
+      SHIM_TRACE("CLEAR_RX_BUFFER drain: channel=%lu round=%d status=%s %s",
+                 channel, round, errorName(r), formatMsg(&batch[i]).c_str());
+    }
     // A short successful read is only a snapshot. Traffic may have arrived
     // between the driver's dequeue and our return (notably periodic
     // TesterPresent), so require an explicit empty result on the next probe.
@@ -1086,9 +1247,13 @@ long drainRxQueue(const Target &target, unsigned long channel, long targetStatus
       return STATUS_NOERROR;
   }
 
-  SHIM_ERROR("CLEAR_RX_BUFFER: drained %lu message(s) and the queue is still not "
-             "empty, reporting the target's %s",
-             drained, errorName(targetStatus));
+  SHIM_ERROR("CLEAR_RX_BUFFER: channel=%lu drained=%lu TX=%lu elapsed=%llu ms; "
+             "drain limit reached without observing an empty queue; returning %s",
+             channel, drained, txCount, GetTickCount64() - started,
+             errorName(targetStatus));
+  for (const auto &entry : endpoints)
+    SHIM_ERROR("CLEAR_RX_BUFFER summary: channel=%lu protocol=0x%lX CAN=0x%lX count=%lu",
+               channel, entry.first.first, entry.first.second, entry.second);
   return targetStatus;
 }
 
@@ -1096,25 +1261,25 @@ long drainRxQueue(const Target &target, unsigned long channel, long targetStatus
 
 void noteFabricate(unsigned long channel, bool on) {
   Guard g;
-  if (on)
-    g_fabricateChannels.insert(channel);
-  else
-    g_fabricateChannels.erase(channel);
+  const auto it = g_channels.find(channel);
+  if (it != g_channels.end())
+    it->second.fabricate = on;
 }
 
 bool fabricateActive(unsigned long channel) {
   Guard g;
-  return g_fabricateChannels.count(channel) != 0;
+  const auto it = g_channels.find(channel);
+  return it != g_channels.end() && it->second.fabricate;
 }
 
 void stopShimPeriodic(unsigned long channel) {
   std::vector<std::shared_ptr<D2PeriodicScheduler>> schedulers;
   {
     Guard g;
-    const auto it = g_periodic.find(channel);
-    if (it == g_periodic.end())
+    const auto it = g_channels.find(channel);
+    if (it == g_channels.end())
       return;
-    for (const auto &entry : it->second) {
+    for (const auto &entry : it->second.periodic) {
       if (entry.second.scheduler)
         schedulers.push_back(entry.second.scheduler);
     }
@@ -1123,19 +1288,20 @@ void stopShimPeriodic(unsigned long channel) {
     scheduler->stop();
 }
 
+void clearPeriodicRegistrations(unsigned long channel) {
+  stopShimPeriodic(channel);
+  Guard g;
+  const auto it = g_channels.find(channel);
+  if (it != g_channels.end()) {
+    it->second.periodic.clear();
+    it->second.suppressionLogged.clear();
+    it->second.ordinaryTx.clear();
+  }
+}
+
 void forgetChannel(unsigned long channel) {
   stopShimPeriodic(channel);
   Guard g;
-  g_fabricateChannels.erase(channel);
-  g_periodic.erase(channel);
-  for (auto it = g_periodicSuppressionLogged.begin();
-       it != g_periodicSuppressionLogged.end();) {
-    if (it->first == channel)
-      it = g_periodicSuppressionLogged.erase(it);
-    else
-      ++it;
-  }
-  g_clearRxEmulationLogged.erase(channel);
   g_channels.erase(channel);
 }
 
@@ -1165,16 +1331,6 @@ void forgetDeviceChannels(unsigned long device) {
       ++it;
       continue;
     }
-    g_fabricateChannels.erase(it->first);
-    g_periodic.erase(it->first);
-    for (auto logged = g_periodicSuppressionLogged.begin();
-         logged != g_periodicSuppressionLogged.end();) {
-      if (logged->first == it->first)
-        logged = g_periodicSuppressionLogged.erase(logged);
-      else
-        ++logged;
-    }
-    g_clearRxEmulationLogged.erase(it->first);
     it = g_channels.erase(it);
     ++stale;
   }
@@ -1184,11 +1340,9 @@ void forgetDeviceChannels(unsigned long device) {
               stale);
 }
 
-// DiCE fabrication is a stateful SWDL stream. SDA may split one programming
-// block across several individually valid PassThruWriteMsgs calls, so neither
-// DataSize nor the ISO-TP 4095-byte limit can identify a safe chunk. Until the
-// proprietary stream contract is implemented, fail the entire active session
-// closed and never expose any of its chunks to the target driver.
+// SDA leaves fabrication enabled during ordinary UDS operations. Reject only
+// oversized writes; implementing the proprietary download stream requires a
+// separately qualified contract and cannot be inferred from this setting.
 // A single ISO-TP message carries at most 4095 payload bytes; SDA prefixes the
 // 4-byte CAN identifier, so anything above this cannot be one message.
 constexpr unsigned long kMaxSingleIsoTpWrite = 4095 + 4;
@@ -1390,10 +1544,15 @@ long WINAPI PassThruConnect(unsigned long DeviceID, unsigned long ProtocolID,
     state->targetFlags = targetFlags;
     state->pins = targetProtocol == CAN_PS ? g_cfg.d2MsPins : 0;
     state->ignoreIntermediateTxAck = g_cfg.d2IgnoreIntermediateTxAck;
+    const long filterStatus = installD2ReceiveFilter(target, state);
+    if (filterStatus != STATUS_NOERROR) {
+      target.Disconnect(*pChannelID);
+      *pChannelID = 0;
+      return filterStatus;
+    }
     {
       Guard g;
-      g_channels[*pChannelID] = {DeviceID, ProtocolID, targetProtocol,
-                                 (Flags & j2534::dice::FUNC_ADDR) != 0, true,
+      g_channels[*pChannelID] = {DeviceID, ProtocolID, targetProtocol, true,
                                  state};
     }
     SHIM_INFO("D2 channel: %s -> %s%s", protocolName(ProtocolID),
@@ -1461,7 +1620,6 @@ long WINAPI PassThruConnect(unsigned long DeviceID, unsigned long ProtocolID,
           Guard g;
           g_channels[*pChannelID] = {
               DeviceID, ProtocolID, psProtocol,
-              (Flags & j2534::dice::FUNC_ADDR) != 0,
           };
           SHIM_INFO("MS fallback: channel %lu now speaks %s to the target, %s to "
                     "the host",
@@ -1476,7 +1634,6 @@ long WINAPI PassThruConnect(unsigned long DeviceID, unsigned long ProtocolID,
     if (g_channels.count(*pChannelID) == 0) {
       g_channels[*pChannelID] = {
           DeviceID, ProtocolID, ProtocolID,
-          (Flags & j2534::dice::FUNC_ADDR) != 0,
       };
     }
   }
@@ -1630,7 +1787,7 @@ long WINAPI PassThruWriteMsgs(unsigned long ChannelID, void *pMsg,
 
   if (Log::instance().enabled(Level::trace)) {
     for (unsigned long i = 0; i < n && msgs; ++i)
-      SHIM_TRACE("-->> PassThruWriteMsgs [ ChannelId:%lu ] %s", ChannelID,
+      SHIM_TRACE("-->> PassThruWriteMsgs [ ChannelId:%lu Timeout:%lu ] %s", ChannelID, Timeout,
                  formatMsg(msgs + i).c_str());
   }
   if (!fabricateWriteSupported(ChannelID, msgs, n)) {
@@ -1648,9 +1805,12 @@ long WINAPI PassThruWriteMsgs(unsigned long ChannelID, void *pMsg,
   if (const auto d2State = d2ChannelSnapshot(ChannelID))
     return d2WriteMsgs(target, d2State, msgs, pNumMsgs, Timeout);
 
-  TxFlagScrubber scrub(ChannelID, msgs, n, "PassThruWriteMsgs");
+  TxFlagScrubber scrub(msgs, n, "PassThruWriteMsgs");
   MsgProtocolScrubber proto(ChannelID, msgs, n);
+  OrdinaryTxReservation reservation(ChannelID, msgs, requested);
   long r = target.WriteMsgs(ChannelID, pMsg, pNumMsgs, Timeout);
+  reservation.finish((r == STATUS_NOERROR || r == ERR_TIMEOUT) && pNumMsgs
+                         ? std::min(requested, *pNumMsgs) : 0);
   if (r == ERR_TIMEOUT && g_cfg.tolerateUnackedFunctionalBroadcasts &&
       allFunctionalBroadcasts(msgs, requested)) {
     SHIM_ERROR("PassThruWriteMsgs: channel %lu target returned %s for "
@@ -1706,7 +1866,7 @@ long WINAPI PassThruStartPeriodicMsg(unsigned long ChannelID, void *pMsg,
                                              TimeInterval);
       if (r == STATUS_NOERROR) {
         Guard g;
-        g_periodic[ChannelID][*pMsgID] =
+        g_channels.at(ChannelID).periodic[*pMsgID] =
             {wireFrames.front().ProtocolID, messageCanId(wireFrames.front()), {}};
       }
       return r;
@@ -1723,7 +1883,7 @@ long WINAPI PassThruStartPeriodicMsg(unsigned long ChannelID, void *pMsg,
     *pMsgID = shimMessageId;
     {
       Guard g;
-      g_periodic[ChannelID][shimMessageId] =
+      g_channels.at(ChannelID).periodic[shimMessageId] =
           {wireFrames.front().ProtocolID, messageCanId(wireFrames.front()), scheduler};
     }
     try {
@@ -1739,18 +1899,21 @@ long WINAPI PassThruStartPeriodicMsg(unsigned long ChannelID, void *pMsg,
     return STATUS_NOERROR;
   }
 
-  TxFlagScrubber scrub(ChannelID, static_cast<PASSTHRU_MSG *>(pMsg), pMsg ? 1 : 0,
+  TxFlagScrubber scrub(static_cast<PASSTHRU_MSG *>(pMsg), pMsg ? 1 : 0,
                        "PassThruStartPeriodicMsg");
   MsgProtocolScrubber proto(ChannelID, static_cast<PASSTHRU_MSG *>(pMsg),
                             pMsg ? 1 : 0);
   // Keep both scrubbers alive through the target call and registration below:
-  // g_periodic intentionally stores the target protocol id while `proto` has
+  // Channel periodic state stores the target protocol id while `proto` has
   // rewritten the caller's message, then the destructors restore host data.
   const long r = target.StartPeriodicMsg(ChannelID, pMsg, pMsgID, TimeInterval);
   if (r == STATUS_NOERROR && pMsg && pMsgID) {
     const PASSTHRU_MSG &msg = *static_cast<const PASSTHRU_MSG *>(pMsg);
     Guard g;
-    g_periodic[ChannelID][*pMsgID] = {msg.ProtocolID, messageCanId(msg)};
+    g_channels.at(ChannelID).periodic[*pMsgID] = {
+        msg.ProtocolID, messageCanId(msg), {},
+        std::vector<unsigned char>(msg.Data, msg.Data +
+            std::min<unsigned long>(msg.DataSize, sizeof(msg.Data)))};
   }
   SHIM_TRACE("<<-- PassThruStartPeriodicMsg [ MsgId:%lu ] -> %s",
              pMsgID ? *pMsgID : 0UL, err2str(r));
@@ -1766,15 +1929,20 @@ long WINAPI PassThruStopPeriodicMsg(unsigned long ChannelID, unsigned long MsgID
   if (!target.loaded())
     return noTarget("PassThruStopPeriodicMsg");
   std::shared_ptr<D2PeriodicScheduler> scheduler;
+  bool registered = false;
   {
     Guard g;
-    const auto channel = g_periodic.find(ChannelID);
-    if (channel != g_periodic.end()) {
-      const auto periodic = channel->second.find(MsgID);
-      if (periodic != channel->second.end())
+    const auto channel = g_channels.find(ChannelID);
+    if (channel != g_channels.end()) {
+      const auto periodic = channel->second.periodic.find(MsgID);
+      if (periodic != channel->second.periodic.end()) {
+        registered = true;
         scheduler = periodic->second.scheduler;
+      }
     }
   }
+  if (d2IsChannel(ChannelID) && !registered)
+    return ERR_INVALID_MSG_ID;
 
   // For a shim-scheduled periodic, `r` reports the worker's last write rather
   // than the stop: see D2PeriodicScheduler::stop. A non-zero value here means
@@ -1844,12 +2012,12 @@ long WINAPI PassThruStartMsgFilter(unsigned long ChannelID, unsigned long Filter
     return STATUS_NOERROR;
   }
 
-  TxFlagScrubber scrubMask(ChannelID, static_cast<PASSTHRU_MSG *>(pMaskMsg),
-                           pMaskMsg ? 1 : 0, "PassThruStartMsgFilter/Mask", false);
+  TxFlagScrubber scrubMask(static_cast<PASSTHRU_MSG *>(pMaskMsg),
+                           pMaskMsg ? 1 : 0, "PassThruStartMsgFilter/Mask");
   TxFlagScrubber scrubPattern(
-      ChannelID, static_cast<PASSTHRU_MSG *>(pPatternMsg), pPatternMsg ? 1 : 0,
-      "PassThruStartMsgFilter/Pattern", false);
-  TxFlagScrubber scrubFlow(ChannelID, static_cast<PASSTHRU_MSG *>(pFlowControlMsg),
+      static_cast<PASSTHRU_MSG *>(pPatternMsg), pPatternMsg ? 1 : 0,
+      "PassThruStartMsgFilter/Pattern");
+  TxFlagScrubber scrubFlow(static_cast<PASSTHRU_MSG *>(pFlowControlMsg),
                            pFlowControlMsg ? 1 : 0,
                            "PassThruStartMsgFilter/Flow");
   MsgProtocolScrubber protoMask(ChannelID, static_cast<PASSTHRU_MSG *>(pMaskMsg),
@@ -1863,6 +2031,8 @@ long WINAPI PassThruStartMsgFilter(unsigned long ChannelID, unsigned long Filter
 
   const long r = target.StartMsgFilter(ChannelID, FilterType, pMaskMsg, pPatternMsg,
                                        pFlowControlMsg, pMsgID);
+  if (r == STATUS_NOERROR && pMsgID)
+    rememberFilter(ChannelID, *pMsgID);
   SHIM_TRACE("<<-- PassThruStartMsgFilter [ MsgId:%lu ] -> %s",
              pMsgID ? *pMsgID : 0UL, err2str(r));
   return r;
@@ -1884,7 +2054,28 @@ long WINAPI PassThruStopMsgFilter(unsigned long ChannelID, unsigned long MsgID) 
     d2State->filters.erase(it);
     return STATUS_NOERROR;
   }
-  const long r = target.StopMsgFilter(ChannelID, MsgID);
+  unsigned long ownerChannel = ChannelID;
+  const FilterOwnerLookup owner = findFilterOwner(ChannelID, MsgID, &ownerChannel);
+  if (g_cfg.repairCrossChannelFilterStop &&
+      owner == FilterOwnerLookup::ambiguous) {
+    SHIM_ERROR("PassThruStopMsgFilter: FilterId %lu has multiple owners on the "
+               "device; refusing unsafe channel correction from %lu",
+               MsgID, ChannelID);
+    setLastError(SHIM_PRODUCT_NAME
+                 ": ambiguous FilterID ownership; channel correction refused");
+    return ERR_INVALID_FILTER_ID;
+  }
+  if (!g_cfg.repairCrossChannelFilterStop ||
+      owner != FilterOwnerLookup::uniqueOther)
+    ownerChannel = ChannelID;
+  else
+    SHIM_INFO("PassThruStopMsgFilter: SDA requested channel %lu for FilterId %lu; "
+              "redirecting to its unique owner channel %lu",
+              ChannelID, MsgID, ownerChannel);
+
+  const long r = target.StopMsgFilter(ownerChannel, MsgID);
+  if (r == STATUS_NOERROR)
+    forgetFilter(ownerChannel, MsgID);
   SHIM_TRACE("<<-- PassThruStopMsgFilter -> %s", err2str(r));
   return r;
   SHIM_GUARD_END("PassThruStopMsgFilter")
@@ -1971,7 +2162,9 @@ long WINAPI PassThruIoctl(unsigned long ChannelID, unsigned long IoctlID,
     const Target target = targetSnapshot();
     if (!target.loaded())
       return noTarget("PassThruIoctl");
-    const auto d2State = IoctlID == CLEAR_RX_BUFFER
+    const bool d2StatefulClear = IoctlID == CLEAR_RX_BUFFER ||
+                                 IoctlID == CLEAR_MSG_FILTERS;
+    const auto d2State = d2StatefulClear
                              ? d2ChannelSnapshot(ChannelID)
                              : std::shared_ptr<d2::D2ChannelState>{};
     long r = target.Ioctl(ChannelID, IoctlID, pInput, pOutput);
@@ -1995,8 +2188,30 @@ long WINAPI PassThruIoctl(unsigned long ChannelID, unsigned long IoctlID,
       r = drained;
     }
 
-    if (IoctlID == CLEAR_RX_BUFFER && r == STATUS_NOERROR)
+    if (IoctlID == CLEAR_RX_BUFFER && r == STATUS_NOERROR) {
       clearD2RxState(d2State);
+      Guard g;
+      const auto it = g_channels.find(ChannelID);
+      if (it != g_channels.end())
+        it->second.ordinaryTx.clear();
+    }
+
+    if (IoctlID == CLEAR_PERIODIC_MSGS && r == STATUS_NOERROR)
+      clearPeriodicRegistrations(ChannelID);
+
+    if (IoctlID == CLEAR_MSG_FILTERS && r == STATUS_NOERROR && d2State) {
+      std::lock_guard<std::mutex> lock(d2State->mutex);
+      d2State->filters.clear();
+      d2State->targetReceiveFilterId = 0;
+      r = installD2ReceiveFilter(target, d2State);
+    }
+
+    if (IoctlID == CLEAR_MSG_FILTERS && r == STATUS_NOERROR) {
+      Guard g;
+      const auto it = g_channels.find(ChannelID);
+      if (it != g_channels.end())
+        it->second.filterOwners.clear();
+    }
 
     SHIM_TRACE("<<-- PassThruIoctl %s -> %s", name, err2str(r));
     return r;

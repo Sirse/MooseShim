@@ -17,6 +17,8 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <thread>
+#include <atomic>
 #include <windows.h>
 
 namespace {
@@ -312,8 +314,8 @@ TEST_CASE("vendor TxFlags bits are stripped and the caller's buffer restored") {
   unsigned long num = 1;
   CHECK(shim().WriteMsgs(ch, &tx, &num, 100) == STATUS_NOERROR);
 
-  CHECK_MESSAGE(logHas("txflags=0x000000C0"),
-                "DiCE FUNC_ADDR must become standard ISO15765_ADDR_TYPE");
+  CHECK_MESSAGE(logHas("txflags=0x00000040"),
+                "DiCE FUNC_ADDR must not enable ISO-TP extended addressing");
   CHECK_FALSE(logHas("txflags=0x20000040"));
   CHECK_FALSE(logHas("txflags=0x30000040"));
   CHECK_MESSAGE(tx.TxFlags == originalTxFlags,
@@ -507,7 +509,7 @@ TEST_CASE("periodic TX indications cannot starve a blocking ECU read") {
   shim().Close(device);
 }
 
-TEST_CASE("a functional DiCE channel uses standard ISO15765 addressing") {
+TEST_CASE("a functional DiCE channel preserves normal ISO15765 addressing") {
   const unsigned long device = freshDevice();
   unsigned long ch = 0;
   REQUIRE(shim().Connect(device, ISO15765,
@@ -520,7 +522,8 @@ TEST_CASE("a functional DiCE channel uses standard ISO15765 addressing") {
   unsigned long num = 1;
   REQUIRE(shim().WriteMsgs(ch, &tx, &num, 100) == STATUS_NOERROR);
   CHECK_MESSAGE(num == 1, "best-effort functional broadcast is reported submitted");
-  CHECK(logHas("txflags=0x000000C0"));
+  CHECK(logHas("txflags=0x00000040"));
+  CHECK_FALSE(logHas("txflags=0x000000C0"));
   CHECK_FALSE(logHas("txflags=0x10000040"));
 
   shim().Disconnect(ch);
@@ -640,6 +643,172 @@ TEST_CASE("a filter on a translated channel is rewritten in both directions") {
 
   shim().StopMsgFilter(ch, filterId);
   shim().Disconnect(ch);
+  shim().Close(device);
+}
+
+TEST_CASE("SDA filter stop is redirected to its unique channel owner") {
+  const unsigned long device = freshDevice();
+  unsigned long wrongChannel = 0;
+  unsigned long ownerChannel = 0;
+  REQUIRE(shim().Connect(device, ISO15765, CAN_29BIT_ID, 125000,
+                         &wrongChannel) == STATUS_NOERROR);
+  REQUIRE(shim().Connect(device, ISO15765, CAN_29BIT_ID, 500000,
+                         &ownerChannel) == STATUS_NOERROR);
+
+  PASSTHRU_MSG mask = makeMsg(ISO15765, ISO15765_FRAME_PAD,
+                              {0xff, 0xff, 0xff, 0xff});
+  PASSTHRU_MSG pattern = makeMsg(ISO15765, ISO15765_FRAME_PAD,
+                                 {0x00, 0x00, 0x07, 0x9b});
+  PASSTHRU_MSG flow = makeMsg(ISO15765, ISO15765_FRAME_PAD,
+                              {0x00, 0x00, 0x07, 0x93});
+  unsigned long filterId = 0;
+  REQUIRE(shim().StartMsgFilter(ownerChannel, FLOW_CONTROL_FILTER, &mask,
+                                &pattern, &flow, &filterId) == STATUS_NOERROR);
+  REQUIRE(shim().StopMsgFilter(wrongChannel, filterId) == STATUS_NOERROR);
+  CHECK(logHas("StopMsgFilter channel=" + std::to_string(ownerChannel) +
+               " msg=" + std::to_string(filterId)));
+
+  shim().Disconnect(ownerChannel);
+  shim().Disconnect(wrongChannel);
+  shim().Close(device);
+}
+
+TEST_CASE("ambiguous cross-channel filter ownership is never guessed") {
+  const unsigned long device = freshDevice();
+  unsigned long first = 0, second = 0, wrong = 0;
+  REQUIRE(shim().Connect(device, ISO15765, CAN_29BIT_ID, 500000, &first) ==
+          STATUS_NOERROR);
+  REQUIRE(shim().Connect(device, ISO15765, CAN_29BIT_ID, 500000, &second) ==
+          STATUS_NOERROR);
+  REQUIRE(shim().Connect(device, ISO15765, CAN_29BIT_ID, 500000, &wrong) ==
+          STATUS_NOERROR);
+
+  PASSTHRU_MSG mask = makeMsg(ISO15765, 0, {0xff, 0xff, 0xff, 0xff});
+  PASSTHRU_MSG pattern = makeMsg(ISO15765, 0, {0x00, 0x00, 0x07, 0x9b});
+  PASSTHRU_MSG flow = makeMsg(ISO15765, 0, {0x00, 0x00, 0x07, 0x93});
+  unsigned long firstId = 0, secondId = 0;
+  REQUIRE(shim().StartMsgFilter(first, FLOW_CONTROL_FILTER, &mask, &pattern,
+                                &flow, &firstId) == STATUS_NOERROR);
+  REQUIRE(shim().StartMsgFilter(second, FLOW_CONTROL_FILTER, &mask, &pattern,
+                                &flow, &secondId) == STATUS_NOERROR);
+  REQUIRE(firstId == secondId);
+  CHECK(shim().StopMsgFilter(wrong, firstId) == ERR_INVALID_FILTER_ID);
+  CHECK(logCount("StopMsgFilter channel=") == 0);
+  CHECK(shim().StopMsgFilter(first, firstId) == STATUS_NOERROR);
+  CHECK(logCount("StopMsgFilter channel=") == 1);
+  CHECK(shim().StopMsgFilter(second, secondId) == STATUS_NOERROR);
+
+  shim().Disconnect(wrong);
+  shim().Disconnect(second);
+  shim().Disconnect(first);
+  shim().Close(device);
+}
+
+TEST_CASE("ordinary TX indication survives periodic on the same CAN id") {
+  const unsigned long device = freshDevice();
+  unsigned long channel = 0;
+  REQUIRE(shim().Connect(device, ISO15765, CAN_29BIT_ID, 500000, &channel) == STATUS_NOERROR);
+  PASSTHRU_MSG periodic = makeMsg(ISO15765, ISO15765_FRAME_PAD,
+                                  {0, 0, 7, 0x36, 0x3e, 0x80});
+  unsigned long periodicId = 0;
+  REQUIRE(shim().StartPeriodicMsg(channel, &periodic, &periodicId, 2000) == STATUS_NOERROR);
+  PASSTHRU_MSG request = makeMsg(ISO15765, ISO15765_FRAME_PAD,
+                                 {0, 0, 7, 0x36, 0x22, 0xf1, 0x8c});
+  unsigned long count = 1;
+  REQUIRE(shim().WriteMsgs(channel, &request, &count, 100) == STATUS_NOERROR);
+  PASSTHRU_MSG rx = {};
+  count = 1;
+  CHECK(shim().ReadMsgs(channel, &rx, &count, 100) == STATUS_NOERROR);
+  CHECK(count == 1);
+  CHECK((rx.RxStatus & TX_MSG_TYPE) != 0);
+  count = 1;
+  CHECK(shim().ReadMsgs(channel, &rx, &count, 20) == ERR_TIMEOUT);
+  CHECK(count == 0);
+  shim().StopPeriodicMsg(channel, periodicId);
+  shim().Disconnect(channel);
+  shim().Close(device);
+}
+
+TEST_CASE("failed write cancels its ordinary TX reservation") {
+  const unsigned long device = freshDevice();
+  unsigned long channel = 0;
+  REQUIRE(shim().Connect(device, ISO15765, CAN_29BIT_ID, 500000, &channel) == STATUS_NOERROR);
+  PASSTHRU_MSG periodic = makeMsg(ISO15765, ISO15765_FRAME_PAD,
+                                  {0, 0, 7, 0xde, 0x3e, 0x80});
+  unsigned long periodicId = 0;
+  REQUIRE(shim().StartPeriodicMsg(channel, &periodic, &periodicId, 2000) == STATUS_NOERROR);
+  PASSTHRU_MSG request = makeMsg(ISO15765, ISO15765_FRAME_PAD,
+                                 {0, 0, 7, 0xde, 0x22, 0xf1, 0x8c});
+  unsigned long count = 1;
+  REQUIRE(shim().WriteMsgs(channel, &request, &count, 100) == ERR_TIMEOUT);
+  CHECK(count == 0);
+  PASSTHRU_MSG rx = {};
+  count = 1;
+  CHECK(shim().ReadMsgs(channel, &rx, &count, 20) == ERR_TIMEOUT);
+  CHECK(count == 0);
+  shim().StopPeriodicMsg(channel, periodicId);
+  shim().Disconnect(channel);
+  shim().Close(device);
+}
+
+TEST_CASE("TX reservation exists before the vendor write returns") {
+  const unsigned long device = freshDevice();
+  unsigned long channel = 0;
+  REQUIRE(shim().Connect(device, ISO15765, CAN_29BIT_ID, 500000, &channel) == STATUS_NOERROR);
+  PASSTHRU_MSG periodic = makeMsg(ISO15765, ISO15765_FRAME_PAD,
+                                  {0, 0, 7, 0x36, 0x3e, 0x80});
+  unsigned long periodicId = 0;
+  REQUIRE(shim().StartPeriodicMsg(channel, &periodic, &periodicId, 2000) == STATUS_NOERROR);
+  using SetDelay = long(WINAPI *)(unsigned long);
+  const auto setDelay = mockFn<SetDelay>("MockSetWriteReturnDelay");
+  REQUIRE(setDelay(150) == STATUS_NOERROR);
+  PASSTHRU_MSG request = makeMsg(ISO15765, ISO15765_FRAME_PAD,
+                                 {0, 0, 7, 0x36, 0x22, 0xf1, 0x8c});
+  std::atomic<bool> returned{false};
+  long writeStatus = ERR_FAILED;
+  std::thread writer([&] {
+    unsigned long count = 1;
+    writeStatus = shim().WriteMsgs(channel, &request, &count, 500);
+    returned.store(true);
+  });
+  for (int i = 0; i < 100 && !logHas("WriteMsgs channel="); ++i)
+    Sleep(1);
+  PASSTHRU_MSG rx = {};
+  unsigned long count = 1;
+  const long readStatus = shim().ReadMsgs(channel, &rx, &count, 30);
+  const bool readBeforeReturn = !returned.load();
+  writer.join();
+  setDelay(0);
+  CHECK(writeStatus == STATUS_NOERROR);
+  CHECK(readBeforeReturn);
+  CHECK(readStatus == STATUS_NOERROR);
+  CHECK(count == 1);
+  CHECK((rx.RxStatus & TX_MSG_TYPE) != 0);
+  shim().StopPeriodicMsg(channel, periodicId);
+  shim().Disconnect(channel);
+  shim().Close(device);
+}
+
+TEST_CASE("CLEAR_MSG_FILTERS removes filter ownership state") {
+  const unsigned long device = freshDevice();
+  unsigned long wrongChannel = 0, ownerChannel = 0;
+  REQUIRE(shim().Connect(device, ISO15765, CAN_29BIT_ID, 125000,
+                         &wrongChannel) == STATUS_NOERROR);
+  REQUIRE(shim().Connect(device, ISO15765, CAN_29BIT_ID, 500000,
+                         &ownerChannel) == STATUS_NOERROR);
+  PASSTHRU_MSG mask = makeMsg(ISO15765, 0, {0xff, 0xff, 0xff, 0xff});
+  PASSTHRU_MSG pattern = makeMsg(ISO15765, 0, {0x00, 0x00, 0x07, 0x9b});
+  PASSTHRU_MSG flow = makeMsg(ISO15765, 0, {0x00, 0x00, 0x07, 0x93});
+  unsigned long filterId = 0;
+  REQUIRE(shim().StartMsgFilter(ownerChannel, FLOW_CONTROL_FILTER, &mask,
+                                &pattern, &flow, &filterId) == STATUS_NOERROR);
+  REQUIRE(shim().Ioctl(ownerChannel, CLEAR_MSG_FILTERS, nullptr, nullptr) ==
+          STATUS_NOERROR);
+  CHECK(shim().StopMsgFilter(wrongChannel, filterId) == ERR_INVALID_FILTER_ID);
+  CHECK(logHas("StopMsgFilter channel=" + std::to_string(wrongChannel)));
+
+  shim().Disconnect(ownerChannel);
+  shim().Disconnect(wrongChannel);
   shim().Close(device);
 }
 
