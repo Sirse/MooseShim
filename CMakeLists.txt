@@ -84,6 +84,7 @@ set_target_properties(mockj2534 PROPERTIES
 # and in the test binary itself.
 add_executable(shim_tests
   tests/doctest_main.cpp
+  tests/test_doctest_string.cpp
   tests/test_config.cpp
   tests/test_d2.cpp
   tests/test_intercept.cpp

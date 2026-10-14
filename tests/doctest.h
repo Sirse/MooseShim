@@ -3666,7 +3666,7 @@ String& String::operator+=(const String& other) {
     if(isOnStack()) {
         if(total_size < len) {
             // append to the current stack space
-            memcpy(buf + my_old_size, other.c_str(), other_size + 1);
+            memmove(buf + my_old_size, other.c_str(), other_size + 1);
             // NOLINTNEXTLINE(clang-analyzer-cplusplus.NewDeleteLeaks)
             setLast(last - total_size);
         } else {
@@ -3674,19 +3674,19 @@ String& String::operator+=(const String& other) {
             char* temp = new char[total_size + 1];
             // copy current data to new location before writing in the union
             memcpy(temp, buf, my_old_size); // skip the +1 ('\0') for speed
+            // Local fix: read the suffix before changing an aliased source.
+            memcpy(temp + my_old_size, other.c_str(), other_size + 1);
             // update data in union
             setOnHeap();
             data.size     = total_size;
             data.capacity = data.size + 1;
             data.ptr      = temp;
-            // transfer the rest of the data
-            memcpy(data.ptr + my_old_size, other.c_str(), other_size + 1);
         }
     } else {
         if(data.capacity > total_size) {
             // append to the current heap block
             data.size = total_size;
-            memcpy(data.ptr + my_old_size, other.c_str(), other_size + 1);
+            memmove(data.ptr + my_old_size, other.c_str(), other_size + 1);
         } else {
             // resize
             data.capacity *= 2;
@@ -3696,13 +3696,13 @@ String& String::operator+=(const String& other) {
             char* temp = new char[data.capacity];
             // copy current data to new location before releasing it
             memcpy(temp, data.ptr, my_old_size); // skip the +1 ('\0') for speed
+            // Local fix: finish reading the source before releasing its storage.
+            memcpy(temp + my_old_size, other.c_str(), other_size + 1);
             // release old chunk
             delete[] data.ptr;
             // update the rest of the union members
             data.size = total_size;
             data.ptr  = temp;
-            // transfer the rest of the data
-            memcpy(data.ptr + my_old_size, other.c_str(), other_size + 1);
         }
     }
 
