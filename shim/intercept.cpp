@@ -5,6 +5,21 @@
 #include <cstdio>
 
 namespace shim {
+bool shouldRetryMsConnect(const Config &cfg, unsigned long protocol,
+                           unsigned long flags, unsigned long baudrate,
+                           long status) {
+  if (!cfg.msFallback || !(flags & PHYSICAL_CHANNEL))
+    return false;
+  if (status == ERR_INVALID_FLAGS || status == ERR_INVALID_PROTOCOL_ID ||
+      status == ERR_NOT_SUPPORTED)
+    return true;
+  // Mongoose refuses the same MS request differently when HS is already open.
+  // A busy channel on other adapters is not evidence of unsupported routing.
+  return cfg.adapterProfile == AdapterProfile::mongoose &&
+         protocol == ISO15765 && baudrate == 125000 &&
+         status == ERR_CHANNEL_IN_USE;
+}
+
 namespace {
 
 struct NameEntry {

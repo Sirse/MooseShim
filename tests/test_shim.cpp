@@ -364,6 +364,45 @@ TEST_CASE("a native dual-CAN adapter keeps the host's direct MS route") {
   shim().Close(device);
 }
 
+TEST_CASE("Mongoose opens MS after HS despite the native channel being busy") {
+  MockModeScope mode(0);
+  const unsigned long device = freshDevice();
+  unsigned long hs = 0, ms = 0;
+  REQUIRE(shim().Connect(device, ISO15765, 0, 500000, &hs) == STATUS_NOERROR);
+  REQUIRE(shim().Connect(device, ISO15765, PHYSICAL_CHANNEL, 125000, &ms) ==
+          STATUS_NOERROR);
+  CHECK(ms != hs);
+  CHECK(ms != 0);
+  CHECK(logCount("Connect device=") == 3);
+  CHECK(logHas("protocol=0x00008005"));
+  CHECK(logHas("param=0x00008001 value=779"));
+  PASSTHRU_MSG tx = makeMsg(ISO15765, ISO15765_FRAME_PAD,
+                             {0, 0, 7, 0x20, 0x22, 0xf1, 0x91});
+  unsigned long count = 1;
+  REQUIRE(shim().WriteMsgs(ms, &tx, &count, 100) == STATUS_NOERROR);
+  CHECK(logHas("protocol=0x00008005 txflags=0x00000040"));
+  pushRx(ISO15765_PS, {0, 0, 7, 0x28, 0x62, 0xf1, 0x91, 0, 0});
+  PASSTHRU_MSG rx = {};
+  count = 1;
+  REQUIRE(shim().ReadMsgs(ms, &rx, &count, 100) == STATUS_NOERROR);
+  CHECK(rx.ProtocolID == ISO15765);
+  CHECK(rx.Data[4] == 0x62);
+  shim().Disconnect(ms);
+  shim().Disconnect(hs);
+  shim().Close(device);
+}
+
+TEST_CASE("busy-channel failure on a direct HS request is preserved") {
+  const unsigned long device = freshDevice();
+  setMockConnectFailure(ERR_CHANNEL_IN_USE);
+  unsigned long channel = 123;
+  CHECK(shim().Connect(device, ISO15765, 0, 500000, &channel) == ERR_CHANNEL_IN_USE);
+  CHECK(channel == 0);
+  CHECK(logCount("Connect device=") == 1);
+  setMockConnectFailure(STATUS_NOERROR);
+  shim().Close(device);
+}
+
 TEST_CASE("MS fallback does not hide a device-level connect failure") {
   MockModeScope mode(0);
   const unsigned long device = freshDevice();
@@ -720,6 +759,37 @@ TEST_CASE("ordinary TX indication survives periodic on the same CAN id") {
   count = 1;
   CHECK(shim().ReadMsgs(channel, &rx, &count, 100) == STATUS_NOERROR);
   CHECK(count == 1);
+  CHECK((rx.RxStatus & TX_MSG_TYPE) != 0);
+  count = 1;
+  CHECK(shim().ReadMsgs(channel, &rx, &count, 20) == ERR_TIMEOUT);
+  CHECK(count == 0);
+  shim().StopPeriodicMsg(channel, periodicId);
+  shim().Disconnect(channel);
+  shim().Close(device);
+}
+
+TEST_CASE("full periodic echo cannot consume an ordinary TX reservation") {
+  const unsigned long device = freshDevice();
+  unsigned long channel = 0;
+  REQUIRE(shim().Connect(device, ISO15765, CAN_29BIT_ID, 500000, &channel) == STATUS_NOERROR);
+  PASSTHRU_MSG periodic = makeMsg(ISO15765, ISO15765_FRAME_PAD,
+                                  {0, 0, 7, 0x36, 0x3e, 0x80});
+  unsigned long periodicId = 0;
+  REQUIRE(shim().StartPeriodicMsg(channel, &periodic, &periodicId, 2000) == STATUS_NOERROR);
+  using PushMessage = long(WINAPI *)(const PASSTHRU_MSG *);
+  const auto pushMessage = mockFn<PushMessage>("MockPushMessage");
+  PASSTHRU_MSG echo = periodic;
+  echo.RxStatus = TX_MSG_TYPE | 0x08;
+  REQUIRE(pushMessage(&echo) == STATUS_NOERROR);
+  PASSTHRU_MSG request = makeMsg(ISO15765, ISO15765_FRAME_PAD,
+                                 {0, 0, 7, 0x36, 0x22, 0xf1, 0x8c});
+  unsigned long count = 1;
+  REQUIRE(shim().WriteMsgs(channel, &request, &count, 100) == STATUS_NOERROR);
+  PASSTHRU_MSG rx = {};
+  count = 1;
+  CHECK(shim().ReadMsgs(channel, &rx, &count, 30) == STATUS_NOERROR);
+  CHECK(count == 1);
+  CHECK(rx.DataSize == 4);
   CHECK((rx.RxStatus & TX_MSG_TYPE) != 0);
   count = 1;
   CHECK(shim().ReadMsgs(channel, &rx, &count, 20) == ERR_TIMEOUT);

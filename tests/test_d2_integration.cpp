@@ -12,6 +12,7 @@
 #include <string>
 #include <thread>
 #include <chrono>
+#include <atomic>
 #include <vector>
 #include <windows.h>
 
@@ -672,6 +673,87 @@ TEST_CASE("blocking D2 reads do not starve scheduled writes") {
   reader.join();
   REQUIRE(session.a.stopPeriodic(session.channel, id) == STATUS_NOERROR);
   CHECK(after > before);
+}
+
+TEST_CASE("continuous filtered D2 traffic allows writes and periodic keepalives") {
+  D2Session session;
+  using ContinuousRx = long(WINAPI *)(const PASSTHRU_MSG *);
+  const auto continuousRx = bind<ContinuousRx>(session.a.mock, "MockSetContinuousRx");
+  REQUIRE(continuousRx != nullptr);
+  PASSTHRU_MSG unrelated = message(CAN, {0, 0, 0, 0x99, 0xCA, 0x40, 0xB9});
+  PASSTHRU_MSG mask = message(j2534::dice::CAN_XON_XOFF_STMIN, {0xff, 0xff, 0xff, 0xff});
+  PASSTHRU_MSG pattern = message(j2534::dice::CAN_XON_XOFF_STMIN, {0, 0, 0, 3});
+  unsigned long filterId = 0;
+  REQUIRE(session.a.startFilter(session.channel, PASS_FILTER, &mask, &pattern,
+                                nullptr, &filterId) == STATUS_NOERROR);
+  REQUIRE(continuousRx(&unrelated) == STATUS_NOERROR);
+  std::atomic<bool> finished{false};
+  long readStatus = ERR_FAILED;
+  unsigned long readCount = 1;
+  std::thread reader([&] {
+    PASSTHRU_MSG rx = {};
+    readStatus = session.a.read(session.channel, &rx, &readCount, 500);
+    finished.store(true);
+  });
+  for (int i = 0; i < 100 && callLog().find("ReadMsgs") == std::string::npos; ++i)
+    Sleep(1);
+  PASSTHRU_MSG request = message(j2534::dice::CAN_XON_XOFF_STMIN,
+                                 {0, 0, 0, 3, 0x40, 0xB9});
+  unsigned long count = 1;
+  const long writeStatus = session.a.write(session.channel, &request, &count, 100);
+  const bool writeDuringRead = !finished.load();
+  PASSTHRU_MSG periodic = message(j2534::dice::CAN_XON_XOFF_STMIN,
+      {0, 0x0f, 0xff, 0xfe, 0xff, 0x86, 0, 0, 0, 0, 0, 0});
+  unsigned long periodicId = 0;
+  const long periodicStatus = session.a.startPeriodic(session.channel, &periodic,
+                                                       &periodicId, 20);
+  const size_t before = occurrences(callLog(), "WriteMsgs");
+  Sleep(80);
+  const size_t after = occurrences(callLog(), "WriteMsgs");
+  const bool periodicDuringRead = !finished.load();
+  reader.join();
+  continuousRx(nullptr);
+  if (periodicStatus == STATUS_NOERROR)
+    session.a.stopPeriodic(session.channel, periodicId);
+  CHECK(writeStatus == STATUS_NOERROR);
+  CHECK(writeDuringRead);
+  CHECK(periodicStatus == STATUS_NOERROR);
+  CHECK(periodicDuringRead);
+  CHECK(after > before);
+  CHECK(readStatus == ERR_TIMEOUT);
+  CHECK(readCount == 0);
+}
+
+TEST_CASE("D2 periodic first frame respects the previous ordinary write STmin") {
+  D2Session session;
+  using GetWriteTime = long(WINAPI *)(unsigned long, unsigned long, ULONGLONG *);
+  const auto getTime = bind<GetWriteTime>(session.a.mock, "MockGetWriteTime");
+  REQUIRE(getTime != nullptr);
+  SCONFIG stmin = {j2534::dice::CAN_XON_XOFF_STMIN, 100};
+  SCONFIG_LIST list = {1, &stmin};
+  REQUIRE(session.a.ioctl(session.channel, SET_CONFIG, &list, nullptr) == STATUS_NOERROR);
+  PASSTHRU_MSG request = message(j2534::dice::CAN_XON_XOFF_STMIN,
+                                 {0, 0, 0, 3, 0x40, 0xB9});
+  unsigned long count = 1;
+  REQUIRE(session.a.write(session.channel, &request, &count, 1000) == STATUS_NOERROR);
+  PASSTHRU_MSG periodic = message(j2534::dice::CAN_XON_XOFF_STMIN,
+      {0, 0x0f, 0xff, 0xfe, 0xff, 0x86, 0, 0, 0, 0, 0, 0});
+  unsigned long periodicId = 0;
+  REQUIRE(session.a.startPeriodic(session.channel, &periodic, &periodicId, 1000) == STATUS_NOERROR);
+  ULONGLONG first = 0, second = 0, third = 0;
+  REQUIRE(getTime(session.channel, 0, &first) == STATUS_NOERROR);
+  long status = ERR_BUFFER_EMPTY;
+  for (int i = 0; i < 1000 && status != STATUS_NOERROR; ++i) {
+    status = getTime(session.channel, 2, &third);
+    if (status != STATUS_NOERROR)
+      Sleep(1);
+  }
+  session.a.stopPeriodic(session.channel, periodicId);
+  REQUIRE(status == STATUS_NOERROR);
+  REQUIRE(getTime(session.channel, 1, &second) == STATUS_NOERROR);
+  // GetTickCount64 has coarse resolution; allow one tick of measurement error.
+  CHECK(second - first >= 85);
+  CHECK(third - second >= 85);
 }
 
 TEST_CASE("D2 STmin respects the WriteMsgs deadline") {

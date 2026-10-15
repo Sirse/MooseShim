@@ -11,6 +11,29 @@
 
 using namespace shim;
 
+TEST_CASE("busy-channel MS fallback is restricted to Mongoose ISO15765 MS") {
+  Config cfg;
+  cfg.msFallback = true;
+  for (const auto profile : {AdapterProfile::generic, AdapterProfile::autoDetect}) {
+    cfg.adapterProfile = profile;
+    CHECK_FALSE(shouldRetryMsConnect(cfg, ISO15765, PHYSICAL_CHANNEL, 125000,
+                                     ERR_CHANNEL_IN_USE));
+  }
+  cfg.adapterProfile = AdapterProfile::mongoose;
+  CHECK(shouldRetryMsConnect(cfg, ISO15765, PHYSICAL_CHANNEL, 125000,
+                              ERR_CHANNEL_IN_USE));
+  CHECK_FALSE(shouldRetryMsConnect(cfg, ISO15765, 0, 125000, ERR_CHANNEL_IN_USE));
+  CHECK_FALSE(shouldRetryMsConnect(cfg, ISO15765, PHYSICAL_CHANNEL, 500000,
+                                   ERR_CHANNEL_IN_USE));
+  CHECK_FALSE(shouldRetryMsConnect(cfg, CAN, PHYSICAL_CHANNEL, 125000,
+                                   ERR_CHANNEL_IN_USE));
+  CHECK_FALSE(shouldRetryMsConnect(cfg, ISO15765, PHYSICAL_CHANNEL, 125000,
+                                   ERR_DEVICE_NOT_CONNECTED));
+  cfg.msFallback = false;
+  CHECK_FALSE(shouldRetryMsConnect(cfg, ISO15765, PHYSICAL_CHANNEL, 125000,
+                                   ERR_CHANNEL_IN_USE));
+}
+
 namespace {
 
 // A configuration equivalent to the shipped INI, built by hand so the

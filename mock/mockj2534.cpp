@@ -30,6 +30,8 @@ struct ChannelState {
   std::map<unsigned long, PASSTHRU_MSG> periodic;
   std::set<unsigned long> filters;
   unsigned long nextFilterId = 3;
+  std::vector<ULONGLONG> writeTimes;
+  unsigned long device = 0;
 };
 std::map<unsigned long, ChannelState> g_channels;
 enum class MockMode : unsigned long { mongoose = 0, strict = 1, nativeDualCan = 2 };
@@ -40,6 +42,8 @@ volatile LONG g_writeReturnDelay = 0;
 // Messages the test has queued for PassThruReadMsgs to hand back, so the
 // receive direction of the shim's protocol translation can be observed.
 std::vector<PASSTHRU_MSG> g_rx;
+PASSTHRU_MSG g_continuousRx = {};
+bool g_continuousRxEnabled = false;
 
 void ensureCs();
 
@@ -130,6 +134,18 @@ long WINAPI PassThruConnect(unsigned long DeviceID, unsigned long ProtocolID,
     // shim is held to not leaking it back to the host.
     if (pChannelID)
       *pChannelID = 0xDEAD;
+    ensureCs();
+    EnterCriticalSection(&g_cs);
+    const bool hsOpen = g_mode == MockMode::mongoose &&
+        std::any_of(g_channels.begin(), g_channels.end(),
+                    [DeviceID](const auto &entry) {
+                      return entry.second.device == DeviceID &&
+                             entry.second.protocol == ISO15765 &&
+                             entry.second.baud == 500000;
+                    });
+    LeaveCriticalSection(&g_cs);
+    if (hsOpen)
+      return ERR_CHANNEL_IN_USE;
     return ERR_INVALID_FLAGS;
   }
 
@@ -139,6 +155,7 @@ long WINAPI PassThruConnect(unsigned long DeviceID, unsigned long ProtocolID,
     EnterCriticalSection(&g_cs);
     g_channels[*pChannelID] =
         {ProtocolID, Baudrate, g_mode == MockMode::mongoose};
+    g_channels[*pChannelID].device = DeviceID;
     LeaveCriticalSection(&g_cs);
   }
   return STATUS_NOERROR;
@@ -167,6 +184,8 @@ long WINAPI PassThruReadMsgs(unsigned long ChannelID, void *pMsg,
   }
   EnterCriticalSection(&g_cs);
   const auto channel = g_channels.find(ChannelID);
+  if (g_rx.empty() && g_continuousRxEnabled)
+    g_rx.push_back(g_continuousRx);
   if (g_rx.empty() && channel != g_channels.end() &&
       !channel->second.periodic.empty()) {
     PASSTHRU_MSG indication = channel->second.periodic.begin()->second;
@@ -213,6 +232,8 @@ long WINAPI PassThruWriteMsgs(unsigned long ChannelID, void *pMsg,
     ensureCs();
     EnterCriticalSection(&g_cs);
     const auto channel = g_channels.find(ChannelID);
+    if (channel != g_channels.end())
+      channel->second.writeTimes.push_back(GetTickCount64());
     const bool hs = channel != g_channels.end() && channel->second.baud == 500000;
     LeaveCriticalSection(&g_cs);
     const bool noAckTarget =
@@ -396,6 +417,7 @@ long WINAPI MockReset(void) {
   EnterCriticalSection(&g_cs);
   g_log.clear();
   g_rx.clear();
+  g_continuousRxEnabled = false;
   g_nextChannel = 100;
   LeaveCriticalSection(&g_cs);
   return STATUS_NOERROR;
@@ -405,6 +427,41 @@ long WINAPI MockReset(void) {
 long WINAPI MockSetWriteReturnDelay(unsigned long milliseconds) {
   InterlockedExchange(&g_writeReturnDelay, static_cast<LONG>(milliseconds));
   return STATUS_NOERROR;
+}
+
+long WINAPI MockPushMessage(const PASSTHRU_MSG *message) {
+  if (!message || message->DataSize > sizeof(message->Data))
+    return ERR_INVALID_MSG;
+  ensureCs();
+  EnterCriticalSection(&g_cs);
+  g_rx.push_back(*message);
+  LeaveCriticalSection(&g_cs);
+  return STATUS_NOERROR;
+}
+
+long WINAPI MockSetContinuousRx(const PASSTHRU_MSG *message) {
+  ensureCs();
+  EnterCriticalSection(&g_cs);
+  g_continuousRxEnabled = message != nullptr;
+  if (message)
+    g_continuousRx = *message;
+  LeaveCriticalSection(&g_cs);
+  return STATUS_NOERROR;
+}
+
+long WINAPI MockGetWriteTime(unsigned long channelId, unsigned long index,
+                            ULONGLONG *time) {
+  if (!time)
+    return ERR_NULL_PARAMETER;
+  ensureCs();
+  EnterCriticalSection(&g_cs);
+  const auto channel = g_channels.find(channelId);
+  const bool found = channel != g_channels.end() &&
+                     index < channel->second.writeTimes.size();
+  if (found)
+    *time = channel->second.writeTimes[index];
+  LeaveCriticalSection(&g_cs);
+  return found ? STATUS_NOERROR : ERR_BUFFER_EMPTY;
 }
 
 long WINAPI MockSetMode(unsigned long mode) {

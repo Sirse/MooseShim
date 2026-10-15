@@ -359,6 +359,17 @@ bool isActivePeriodicTxIndication(unsigned long channel,
   const auto channelIt = g_channels.find(channel);
   if (channelIt == g_channels.end())
     return false;
+  // A full periodic echo identifies its source. Do not spend an ordinary
+  // request's reservation on it; ID-only indications are handled below.
+  if (msg.DataSize > 4) {
+    for (const auto &entry : channelIt->second.periodic) {
+      const auto &periodic = entry.second;
+      if (periodic.protocol == msg.ProtocolID && periodic.canId == id &&
+          msg.DataSize == periodic.payload.size() &&
+          std::equal(periodic.payload.begin(), periodic.payload.end(), msg.Data))
+        return true;
+    }
+  }
   {
     auto &pending = channelIt->second.ordinaryTx;
     const ULONGLONG now = GetTickCount64();
@@ -632,7 +643,9 @@ private:
       {
         std::unique_lock<std::mutex> stateLock(state_->mutex);
         for (size_t i = 0; i < frames_.size(); ++i) {
-          if (stopping())
+          // Timing belongs to the channel, including the preceding ordinary
+          // write and other periodic registrations. Check before every frame.
+          if (waitUntil(state_->timing.nextFrameTime()))
             return;
           unsigned long count = 1;
           const long r = target_.WriteMsgs(channel_, &frames_[i], &count, 0);
@@ -641,9 +654,6 @@ private:
             return;
           }
           state_->timing.markFrameSent(std::chrono::steady_clock::now());
-          if (i + 1 < frames_.size() &&
-              waitUntil(state_->timing.nextFrameTime()))
-            return;
         }
       }
 
@@ -987,7 +997,23 @@ long d2ReadMsgs(const Target &target,
     }
   }
   unsigned long received = 0;
+  auto sliceStarted = std::chrono::steady_clock::now();
+  unsigned long sliceFrames = 0;
   for (;;) {
+    // Empty reads are not the only opportunity to yield. Busy or filtered
+    // traffic must also let writers acquire the channel between RX slices.
+    if (++sliceFrames > 32 ||
+        std::chrono::steady_clock::now() - sliceStarted >=
+            std::chrono::milliseconds(5)) {
+      lock.unlock();
+      if (timeout != 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      else
+        std::this_thread::yield();
+      lock.lock();
+      sliceFrames = 0;
+      sliceStarted = std::chrono::steady_clock::now();
+    }
     const auto now = std::chrono::steady_clock::now();
     bool assemblyExpired = false;
     for (auto &entry : state->reassemblers) {
@@ -1589,12 +1615,10 @@ long WINAPI PassThruConnect(unsigned long DeviceID, unsigned long ProtocolID,
   // SDA asks for the MS bus as ISO15765 + PHYSICAL_CHANNEL. Adapters without a
   // second physical CAN refuse that, but reach the same wires through the
   // J2534-2 pin-switched protocol. Retry that way when configured.
-  const bool routeUnsupported = r == ERR_INVALID_FLAGS ||
-                                r == ERR_INVALID_PROTOCOL_ID ||
-                                r == ERR_NOT_SUPPORTED;
-  if (routeUnsupported && g_cfg.msFallback && (flags & PHYSICAL_CHANNEL)) {
+  if (shouldRetryMsConnect(g_cfg, ProtocolID, flags, Baudrate, r)) {
     const unsigned long psProtocol = pinSwitchedForm(ProtocolID);
     if (psProtocol) {
+      const long originalRefusal = r;
       SHIM_INFO("MS fallback: %s + PHYSICAL_CHANNEL refused (%s), retrying as %s "
                 "with J1962_PINS=0x%04lX",
                 protocolName(ProtocolID), err2str(r), protocolName(psProtocol),
@@ -1615,7 +1639,7 @@ long WINAPI PassThruConnect(unsigned long DeviceID, unsigned long ProtocolID,
                      err2str(pinStatus));
           target.Disconnect(*pChannelID);
           *pChannelID = 0; // the id we just destroyed must not escape
-          r = ERR_INVALID_FLAGS; // report the original refusal to the host
+          r = originalRefusal;
         } else {
           Guard g;
           g_channels[*pChannelID] = {

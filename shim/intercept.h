@@ -60,6 +60,10 @@ std::string numericKey(Category cat, unsigned long id);
 unsigned long filterConnectFlags(const Config &cfg, unsigned long flags,
                                  unsigned long *removed);
 
+bool shouldRetryMsConnect(const Config &cfg, unsigned long protocol,
+                           unsigned long flags, unsigned long baudrate,
+                           long status);
+
 // Strips vendor bits from PASSTHRU_MSG::TxFlags. This is a *different* number
 // space from Connect flags: J2534 v04.04 defines no TxFlags bit above
 // 0x00800000, and neither DrewTech nor DiCE define bit 29 - yet SDA sets
