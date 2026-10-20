@@ -10,7 +10,7 @@ project(MooseShim CXX)
 # where the operator needs to read what the device is. Authorship lives in the
 # version resource (cmake/version.rc.in) and in LICENSE.
 set(SHIM_NAME "MooseShim" CACHE STRING "Product name: DLL, INI, registry key, log tag")
-set(SHIM_VERSION "0.4.0")
+set(SHIM_VERSION "0.4.1")
 set(SHIM_AUTHOR "Sirse")
 set(SHIM_COPYRIGHT "Copyright (c) 2026 Sirse")
 
