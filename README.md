@@ -1,5 +1,7 @@
 # MooseShim
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Sirse/MooseShim/)
+
 MooseShim is a 32-bit J2534 compatibility layer that lets some vendor specific
 software (e.g. SDA) use a generic J2534 adapter in place of DiCE. It has been
 developed and tested with MongoosePro JLR.
