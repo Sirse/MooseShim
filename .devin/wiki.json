@@ -1,0 +1,108 @@
+{
+  "repo_notes": [
+    {
+      "content": "Write the wiki in English for both SDA users and maintainers. Keep it concise and task-oriented. Explain terminology where first used rather than creating a separate glossary. Avoid repeating child-page content in parent pages, exhaustive symbol catalogs, full struct listings, and diagrams that merely repeat a short paragraph. Use only the explicitly listed pages."
+    },
+    {
+      "content": "Ground every behavioral claim in the indexed implementation and relevant regression tests. Link directly to the source that establishes the claim: LICENSE is not evidence for API behavior or structure layouts, and include directives are not evidence for runtime behavior. Do not invent API names (the export is PassThruWriteMsgs, not PassThruWriteData). Derive current constants, defaults, environment variable names and precedence from code, generated product definitions and tests; comments and prior wiki text can be stale. Do not hardcode a release version or line numbers in explanatory prose. Use small valid Mermaid diagrams with quoted labels only when they add information."
+    },
+    {
+      "content": "Separate implemented behavior, mock regression coverage and real adapter/vehicle qualification. MooseShim was developed and tested with MongoosePro JLR; generic J2534 compatibility is a design goal, not a claim that every adapter works. D2/DII is experimental and disabled by default; protocol acknowledgements and flashing are not qualified. Tests do not open real hardware. Do not infer programming safety or supported ECU/SBL combinations from passing tests or successful transmission."
+    },
+    {
+      "content": "Keep diagnostic layers distinct: a J2534 return code, message RxStatus, an ECU negative response and an SDA GUI exception are different observations. STATUS_NOERROR is not proof of ECU reception, especially for tolerated unacknowledged functional broadcasts. An API TX indication is not a raw on-wire capture. Do not prescribe fabricating positive ECU replies, hiding protocol errors or disabling all TX indications. Do not rely on private SDA installations, local logs or sibling repositories as public dependencies; document only evidence available in this repository and explicitly mark unknowns."
+    }
+  ],
+  "pages": [
+    {
+      "title": "Overview",
+      "purpose": "Introduce the Win32 J2534 v04.04 compatibility DLL, the SDA to MooseShim to target-driver call chain, supported ISO15765 scope, experimental D2 and unsupported proprietary streaming. Give a short repository map and links to user and maintainer entry points. Use README.md and CMakeLists.txt; do not reproduce the installation guide or child-page summaries at length."
+    },
+    {
+      "title": "User Guide",
+      "purpose": "Provide a short navigation hub for installation, configuration and troubleshooting. Explain required components, the distinction between shim DLL and actual adapter driver, and the boundary between compatibility and hardware qualification. Do not repeat detailed procedures from child pages."
+    },
+    {
+      "title": "Installation and Registration",
+      "parent": "User Guide",
+      "purpose": "Explain installing the released DLL and adjacent generated INI, configuring the real 32-bit target DLL, adapting tools/register.reg.template under WOW6432Node, selecting MooseShim in SDA and checking initialization logs. Distinguish release installation from building source. Explain architecture mismatch, missing exports, target path and device-name selection failures using README.md, tools/, shim/target.cpp and initialization in shim/exports.cpp."
+    },
+    {
+      "title": "Configuration and Adapter Profiles",
+      "parent": "User Guide",
+      "purpose": "Document INI location and load timing, target device selection, auto/generic/mongoose profile defaults, explicit per-feature overrides, intercept policy syntax, environment overrides and warnings. Build a compact configuration reference from shim/config.h, shim/config.cpp, shim.ini, cmake/product.h.in and tests/test_config.cpp. Distinguish compiled defaults, profile defaults and values explicitly present in the supplied INI.",
+      "page_notes": [
+        {
+          "content": "auto is refusal-driven compatibility, not a hardware capability scanner. Explain that explicit channel keys override profile defaults, so changing adapter_profile alone need not disable explicitly configured workarounds. Derive actual environment variable names from generated product macros and consumers, not stale INI comments. Include the logged D2 route environment override and the risks of vendor-ID forwarding."
+        }
+      ]
+    },
+    {
+      "title": "Troubleshooting and Log Analysis",
+      "parent": "User Guide",
+      "purpose": "Give an evidence-driven symptom to check to interpretation guide. Cover initialization/registration, MS-CAN refusal and HS-first routing, periodic TX starvation, blocking versus nonblocking read outcomes, bounded RX draining and filter cleanup. Explain log levels, path selection, rotation, payload truncation and DataSize using shim/log.cpp and callers. Show how to distinguish J2534 errors, RxStatus flags, ECU NRCs and host exceptions without claiming a diagnosis unsupported by repository evidence.",
+      "page_notes": [
+        {
+          "content": "Explain what a tolerated 0x7DF write timeout does and does not establish. Explain how drain-limit diagnostics differ from proof of an empty queue. ECU 7F 35 11 denotes an ECU refusal, not inherently a shim timeout; loader/session compatibility requires independent evidence. A GUI Text-property exception cannot be diagnosed from the shim alone. Do not present private historical incidents as shipped test fixtures or publish machine-specific paths."
+        }
+      ]
+    },
+    {
+      "title": "Compatibility Architecture",
+      "purpose": "Explain responsibility boundaries among shim/exports.cpp, shim/intercept.cpp, shim/config.cpp, shim/target.cpp and shim/log.cpp. Summarize the 14 exported ABI entry points by workflow rather than listing every wrapper. Explain lazy initialization, target DLL export binding and lifetime; do not claim capability probing in loadTarget. Link detailed routing, policy and message-flow pages."
+    },
+    {
+      "title": "Vendor IDs and Flag Translation",
+      "parent": "Compatibility Architecture",
+      "purpose": "Explain category-separated ioctl/config/protocol/flag number spaces, DiCE and DrewTech collisions, forward/absorb/reject policies, unknown vendor protection, and distinct Connect Flags and message TxFlags handling. Use shim/intercept.*, shim/include/ and tests/test_intercept.cpp with actual call sites. Explain standard extended addressing versus DiCE functional-address flags and the SWDL fabrication boundary.",
+      "page_notes": [
+        {
+          "content": "ISO15765_ADDR_TYPE is extended addressing, not a functional-request marker. Do not infer functional intent from a whole channel or a CAN identifier alone where the implementation requires more checks. SDA can leave ISO15765_SWDL_FABRICATE enabled during ordinary UDS; normally sized writes remain allowed, while payloads exceeding 4095 bytes plus the four-byte CAN ID are rejected with ERR_NOT_SUPPORTED. Verify exact conditions in code rather than describing all fabricate-mode writes as unsupported."
+        }
+      ]
+    },
+    {
+      "title": "Channel Routing and Resource Lifecycle",
+      "parent": "Compatibility Architecture",
+      "purpose": "Describe host/target protocol mapping and per-device channel ownership; direct connection before MS fallback; target refusal classes, pin selection, loopback setup and the narrowly scoped Mongoose busy-channel exception. Explain filters, exact-owner preference, unambiguous same-device cleanup repair and ambiguous-ID failure. Follow Disconnect, Close and CLEAR operations through all relevant state cleanup using shim/exports.cpp and tests/test_shim.cpp."
+    },
+    {
+      "title": "TX, RX and Periodic Messages",
+      "parent": "Compatibility Architecture",
+      "purpose": "Trace ordinary writes, target-owned periodic registration, selective periodic TX-indication suppression, preserved ordinary confirmations, read deadlines and RX-buffer emulation. Explain synchronization and resource cleanup using shim/exports.cpp and regression tests. Keep experimental D2 scheduler details on the D2 timing page.",
+      "page_notes": [
+        {
+          "content": "Explain full-payload periodic-echo matching before ordinary TX-credit consumption, ID-only indication ambiguity, reservation lifetime and rollback on unsuccessful writes. Filtering periodic indications must preserve the remaining read deadline; Timeout=0 returns ERR_BUFFER_EMPTY when no deliverable message remains. LOOPBACK=0 alone is not sufficient evidence that a target emits no periodic indications. Explain bounded drain behavior without equating a short read with an empty queue."
+        }
+      ]
+    },
+    {
+      "title": "Experimental D2/DII",
+      "purpose": "Introduce the opt-in CAN_XON_XOFF translation and d2_route reject/can/can_ps/auto behavior, standard target protocols, supported bitrate/29-bit/sample-point settings and qualification limits. Make the distinction between raw SDA-provided CAN payloads and transport-segmented logical messages explicit, citing the routing and conversion call sites as well as the pure transport. Do not imply every D2 write is segmented."
+    },
+    {
+      "title": "D2 Framing, Routing and Timing",
+      "parent": "Experimental D2/DII",
+      "purpose": "Explain CAN_FRAME_RAW selection, raw expectations, segmentation/reassembly byte layouts, sequence validation, size/assembly deadlines, receive filters and TX acknowledgement handling. Cover shim-owned multi-frame periodic scheduling, shared STmin before every frame including the first, read serialization, bounded target-read slices and fairness under continuous RX. Use shim/d2/*, actual integration paths in shim/exports.cpp, tests/test_d2.cpp and tests/test_d2_integration.cpp.",
+      "page_notes": [
+        {
+          "content": "For every byte-layout example specify which boundary it represents: host J2534 message including four CAN-ID bytes, logical payload, or target CAN frame. Use literal regression fixtures where available; do not derive supposed real-world traces from the encoder itself. Explain raw control/service payloads without treating their first byte as a transport header indiscriminately. Clearly distinguish implemented ACK handling from hardware qualification."
+        }
+      ]
+    },
+    {
+      "title": "Development",
+      "purpose": "Give maintainers a compact source/test map, C++ and Win32 requirements and pointers to build/release and regression workflows. Explain that mock/ and tests/ are maintained development components, not runtime dependencies. Keep full commands and detailed test scenarios on the child pages."
+    },
+    {
+      "title": "Build, CI and Releases",
+      "parent": "Development",
+      "purpose": "Document CMake Win32 configure/build/ctest commands, static MSVC runtime, undecorated exports, generated product identity/configuration/registration files, packaged artifacts and the actual GitHub Actions CI/release triggers. Use CMakeLists.txt, cmake/, tools/ and .github/workflows/. Derive versions and action revisions from current sources rather than preserving old wiki values."
+    },
+    {
+      "title": "Mock Driver and Regression Coverage",
+      "parent": "Development",
+      "purpose": "Explain the two CTest suites and unit/config/intercept/D2/DLL-integration coverage; Mongoose, strict-J2534 and native-dual-CAN mock modes; failure injection, continuous RX, periodic indications and timing measurements. Show how to add an independently specified regression for routing, deadlines, cleanup or byte layout using mock/mockj2534.cpp and tests/. Explain the vendored doctest local aliasing regression without documenting the framework internals. Distinguish deterministic test guarantees from untested hardware behavior."
+    }
+  ]
+}
